@@ -158,7 +158,7 @@ std::vector<MemorySpan> memorySpans(HANDLE process, Address address, std::size_t
         if (span.region.State != MEM_COMMIT || address < start || address - start >= span.region.RegionSize)
             throw std::runtime_error(
                 memoryDiagnostic("Memory range is not committed", span, 0, ERROR_INVALID_ADDRESS));
-        span.size = std::min(size, span.region.RegionSize - (address - start));
+        span.size = std::min<std::size_t>(size, span.region.RegionSize - (address - start));
         result.push_back(span);
         size -= span.size;
         if (size)
