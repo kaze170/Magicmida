@@ -7,3 +7,15 @@ Win32/
 __history/
 backup/
 lib/
+
+# Native C++ build and local tools
+.vs/
+artifacts/
+.cache/
+*.user
+*.VC.db
+*.VC.VC.opendb
+
+# Python validation caches
+__pycache__/
+*.py[cod]

@@ -1,0 +1,22 @@
+<Solution>
+  <Configurations>
+    <BuildType Name="Debug" />
+    <BuildType Name="Release" />
+    <Platform Name="Win32" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="Magicmida.vcxproj" />
+  <Folder Name="/Libraries/">
+    <Project Path="Magicmida.Core.vcxproj" />
+    <Project Path="BeaEngine.vcxproj" />
+  </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Magicmida.Tests.vcxproj" />
+  </Folder>
+  <Folder Name="/Documentation/">
+    <File Path="README.md" />
+    <File Path="docs/VC2026-migration.md" />
+    <File Path="LICENSE" />
+    <File Path="Native.Common.props" />
+  </Folder>
+</Solution>

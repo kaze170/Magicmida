@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup><Filter Include="Source Files" /><Filter Include="Header Files" /><Filter Include="Resources" /></ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="native\AntiDumpFix.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\DebuggerCore.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\Dumper.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\OneCoreUAP.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\PEInfo.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\Patcher.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\Themida.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\Themida64.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\ThemidaCommon.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\Tracer.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="native\Utils.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClInclude Include="native\Binary.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\DebuggerCore.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\Dumper.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\OneCoreUAP.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\PEInfo.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\Patcher.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\Themida.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\Themida64.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\ThemidaCommon.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\Utils.hpp"><Filter>Header Files</Filter></ClInclude>
+  </ItemGroup>
+</Project>

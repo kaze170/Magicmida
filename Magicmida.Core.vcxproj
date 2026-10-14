@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32"><Configuration>Debug</Configuration><Platform>Win32</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32"><Configuration>Release</Configuration><Platform>Win32</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals"><ProjectGuid>{0E597551-30B7-5699-A69D-6C9037409390}</ProjectGuid><Keyword>Win32Proj</Keyword><RootNamespace>MagicmidaCore</RootNamespace><WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration"><ConfigurationType>StaticLibrary</ConfigurationType><PlatformToolset>v145</PlatformToolset><CharacterSet>Unicode</CharacterSet></PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration"><UseDebugLibraries>true</UseDebugLibraries></PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration"><UseDebugLibraries>false</UseDebugLibraries></PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets"><Import Project="Native.Common.props" /></ImportGroup>
+  <ItemGroup>
+    <ClCompile Include="native\AntiDumpFix.cpp" />
+    <ClCompile Include="native\DebuggerCore.cpp" />
+    <ClCompile Include="native\Dumper.cpp" />
+    <ClCompile Include="native\OneCoreUAP.cpp" />
+    <ClCompile Include="native\PEInfo.cpp" />
+    <ClCompile Include="native\Patcher.cpp" />
+    <ClCompile Include="native\Themida.cpp" />
+    <ClCompile Include="native\Themida64.cpp" />
+    <ClCompile Include="native\ThemidaCommon.cpp" />
+    <ClCompile Include="native\Tracer.cpp" />
+    <ClCompile Include="native\Utils.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="native\Binary.hpp" />
+    <ClInclude Include="native\DebuggerCore.hpp" />
+    <ClInclude Include="native\Dumper.hpp" />
+    <ClInclude Include="native\OneCoreUAP.hpp" />
+    <ClInclude Include="native\PEInfo.hpp" />
+    <ClInclude Include="native\Patcher.hpp" />
+    <ClInclude Include="native\Themida.hpp" />
+    <ClInclude Include="native\Themida64.hpp" />
+    <ClInclude Include="native\ThemidaCommon.hpp" />
+    <ClInclude Include="native\Utils.hpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

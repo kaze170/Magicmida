@@ -1,0 +1,51 @@
+name: Native C++26
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate solution, source inventory and Pascal data parity
+        run: python3 tools/validate_native.py
+      - name: Build and run portable tests
+        run: |
+          mkdir -p artifacts/portable
+          g++ -std=c++23 -Wall -Wextra -Wpedantic -Werror -Inative -Itests -DMM_PORTABLE_MAIN tests/PortableTests.cpp native/OneCoreUAP.cpp -o artifacts/portable/tests
+          artifacts/portable/tests
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [Win32, x64]
+        configuration: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[18.0,19.0)'
+      - name: Build native solution
+        shell: pwsh
+        run: >-
+          msbuild Magicmida.slnx /m /t:Build
+          /p:Configuration=${{ matrix.configuration }}
+          /p:Platform=${{ matrix.platform }}
+          /bl:artifacts/build-${{ matrix.platform }}-${{ matrix.configuration }}.binlog
+      - name: Test native core and CLI
+        shell: pwsh
+        run: ./tools/Test-Native.ps1 -Platform '${{ matrix.platform }}' -Configuration '${{ matrix.configuration }}'
+      - name: Upload binaries and build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Magicmida-${{ matrix.platform }}-${{ matrix.configuration }}
+          path: |
+            artifacts/bin/${{ matrix.platform }}/${{ matrix.configuration }}/
+            artifacts/build-${{ matrix.platform }}-${{ matrix.configuration }}.binlog
+          if-no-files-found: warn
