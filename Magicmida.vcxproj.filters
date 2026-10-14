@@ -7,5 +7,9 @@
     <ResourceCompile Include="native\Magicmida.rc"><Filter>Resources</Filter></ResourceCompile>
     <Manifest Include="native\Magicmida.manifest"><Filter>Resources</Filter></Manifest>
     <Content Include="scylla_hide.ini"><Filter>Resources</Filter></Content>
+    <Content Include="native\assets\application.ico"><Filter>Resources</Filter></Content>
+    <Content Include="native\assets\information.ico"><Filter>Resources</Filter></Content>
+    <Content Include="native\assets\success.ico"><Filter>Resources</Filter></Content>
+    <Content Include="native\assets\error.ico"><Filter>Resources</Filter></Content>
   </ItemGroup>
 </Project>

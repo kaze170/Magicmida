@@ -39,11 +39,12 @@ void consoleLog(LogType type, const std::wstring &text) {
         WriteFile(out, bytes.data(), static_cast<DWORD>(bytes.size()), &n, nullptr);
     }
 }
-std::optional<Path> chooseFile(HWND owner) {
+std::optional<Path> chooseFile(HWND owner, const wchar_t *title = nullptr) {
     std::wstring path(32768, 0);
     OPENFILENAMEW o{};
     o.lStructSize = sizeof(o);
     o.hwndOwner = owner;
+    o.lpstrTitle = title;
     o.lpstrFile = path.data();
     o.nMaxFile = static_cast<DWORD>(path.size());
     o.lpstrFilter = L"Application or DLL\0*.exe;*.dll\0Any file\0*.*\0\0";
@@ -109,11 +110,9 @@ class Window {
             MoveWindow(GetDlgItem(hwnd_, id), px(x), px(y), px(cx), px(cy), TRUE);
         };
         place(IDC_UNPACK, 10, 10, 90, 28);
-#ifndef _WIN64
         place(IDC_DATA, 112, 10, 200, 28);
         place(IDC_DUMP, 320, 10, 102, 28);
         place(IDC_SHRINK, 432, 10, 210, 28);
-#endif
         MoveWindow(GetDlgItem(hwnd_, IDC_CANCEL), w - px(100), px(10), px(90), px(28), TRUE);
         MoveWindow(list_, px(10), px(48), std::max(1, w - px(20)), std::max(1, h - px(83)), TRUE);
         MoveWindow(GetDlgItem(hwnd_, IDC_STATUS), px(12), h - px(27), std::max(1, w - px(24)), px(22), TRUE);
@@ -230,7 +229,6 @@ class Window {
             });
             return;
         }
-#ifndef _WIN64
         if (id == IDC_DUMP) {
             DWORD pid{};
             if (DialogBoxParamW(instance_, MAKEINTRESOURCEW(IDD_PID), hwnd_, pidDialog,
@@ -239,28 +237,34 @@ class Window {
             auto p = chooseFile(hwnd_);
             if (p)
                 start([p = *p, pid](const Logger &log) { Patcher(p, log).dumpProcess(pid); });
-        } else if (id == IDC_SHRINK || id == IDM_CREATE_DATA) {
+        } else if (id == IDC_SHRINK || id == IDM_CREATE_DATA || id == IDM_CREATE_REFERENCE) {
             auto p = chooseFile(hwnd_);
             if (!p)
                 return;
+            Path reference;
+            if (id == IDM_CREATE_REFERENCE) {
+                auto ref = chooseFile(
+                    hwnd_, L"Choose a reference PE from the SAME BUILD with the original section layout");
+                if (!ref)
+                    return;
+                reference = *ref;
+            }
             if (MessageBoxW(hwnd_,
                             id == IDC_SHRINK
-                                ? L"This overwrites the selected file and can break targets that still use "
-                                  L"VM code or non-MSVC runtimes. Make a backup first. Continue?"
+                                ? L"This compacts raw padding but retains all sections and overlay. "
+                                  L"It invalidates signatures. Make a backup first. Continue?"
                                 : L"This rewrites section headers in the selected file. Make a backup first. "
                                   L"Continue?",
                             L"Confirm file modification", MB_YESNO | MB_ICONWARNING) != IDYES)
                 return;
-            start([p = *p, id](const Logger &log) {
+            start([p = *p, id, reference](const Logger &log) {
                 Patcher patch(p, log);
                 if (id == IDC_SHRINK)
                     patch.shrink();
                 else
-                    patch.createData();
-                log(LogType::Good, L"File processing completed.");
+                    patch.createData(reference);
             });
         }
-#endif
     }
     LRESULT message(UINT msg, WPARAM wp, LPARAM lp) {
         switch (msg) {
@@ -270,12 +274,10 @@ class Window {
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH,
                                 L"Segoe UI");
             createControl(L"BUTTON", L"Unpack", IDC_UNPACK, WS_TABSTOP | BS_PUSHBUTTON);
-#ifndef _WIN64
             createControl(L"BUTTON", L"Auto create data sections", IDC_DATA, WS_TABSTOP | BS_AUTOCHECKBOX);
             CheckDlgButton(hwnd_, IDC_DATA, BST_CHECKED);
             createControl(L"BUTTON", L"Dump process", IDC_DUMP, WS_TABSTOP);
-            createControl(L"BUTTON", L"Shrink (after unvirtualizing)", IDC_SHRINK, WS_TABSTOP);
-#endif
+            createControl(L"BUTTON", L"Compact (keep all sections)", IDC_SHRINK, WS_TABSTOP);
             createControl(L"BUTTON", L"Cancel", IDC_CANCEL, WS_TABSTOP);
             createControl(WC_LISTVIEWW, L"", IDC_LOG,
                           WS_TABSTOP | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SHOWSELALWAYS);
@@ -325,11 +327,12 @@ class Window {
                 winError("CreatePopupMenu");
             if (target == list_)
                 AppendMenuW(menu, MF_STRING, IDM_COPY, L"Copy entire log");
-#ifndef _WIN64
-            else if (target == GetDlgItem(hwnd_, IDC_DATA))
+            else if (target == GetDlgItem(hwnd_, IDC_DATA)) {
                 AppendMenuW(menu, MF_STRING | (busy_ ? MF_GRAYED : 0), IDM_CREATE_DATA,
-                            L"Create sections now");
-#endif
+                            L"Conservative automatic split");
+                AppendMenuW(menu, MF_STRING | (busy_ ? MF_GRAYED : 0), IDM_CREATE_REFERENCE,
+                            L"Restore layout from same-build reference...");
+            }
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             if (pt.x == -1 && pt.y == -1) {
                 RECT r{};
@@ -439,17 +442,29 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         if (!GetStdHandle(STD_OUTPUT_HANDLE) || GetStdHandle(STD_OUTPUT_HANDLE) == INVALID_HANDLE_VALUE)
             AttachConsole(ATTACH_PARENT_PROCESS);
         SetConsoleCtrlHandler(consoleHandler, TRUE);
+        const auto usage = L"Usage: Magicmida.exe /unpack <file> [--no-data]\r\n"
+                           L"       Magicmida.exe /create-data <file> [--reference <same-build PE>]\r\n"
+                           L"       Magicmida.exe /shrink <file>\r\n"
+                           L"Use the matching architecture. Section edits overwrite the file; back up first. "
+                           L"Exit codes: 0 success, 1 failure/cancel/no safe split, 2 usage.";
         if (args[1] == L"/?" || args[1] == L"/help" || args[1] == L"--help") {
-            consoleLog(LogType::Info,
-                       L"Usage: Magicmida.exe /unpack <filename> [--no-data]\r\nUse the architecture "
-                       L"matching the target. Exit codes: 0 success, 1 failure/cancel, 2 usage.");
+            consoleLog(LogType::Info, usage);
             return 0;
         }
-        if (args[1] != L"/unpack" || argc < 3 || argc > 4 || (argc == 4 && args[3] != L"--no-data")) {
-            consoleLog(LogType::Fatal, L"Usage: Magicmida.exe /unpack <filename> [--no-data]");
+        bool unpack = args[1] == L"/unpack" && (argc == 3 || (argc == 4 && args[3] == L"--no-data"));
+        bool sections = args[1] == L"/create-data" && (argc == 3 || (argc == 5 && args[3] == L"--reference"));
+        bool shrink = args[1] == L"/shrink" && argc == 3;
+        if (!unpack && !sections && !shrink) {
+            consoleLog(LogType::Fatal, usage);
             return 2;
         }
         try {
+            if (sections)
+                return Patcher(args[2], consoleLog).createData(argc == 5 ? Path(args[4]) : Path{}) ? 0 : 1;
+            if (shrink) {
+                Patcher(args[2], consoleLog).shrink();
+                return 0;
+            }
             Unpacker u(args[2], argc < 4, consoleLog, consoleCancel);
             return u.run() ? 0 : 1;
         } catch (const std::exception &e) {

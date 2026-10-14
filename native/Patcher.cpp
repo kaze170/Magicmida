@@ -2,253 +2,383 @@
 #include "Patcher.hpp"
 #include <tlhelp32.h>
 namespace mm {
-#ifndef _WIN64
-std::optional<std::size_t> Patcher::find(std::string_view pattern, std::size_t start) const {
-    if (start >= data_.size())
-        return {};
-    auto p = findPattern(std::span(data_).subspan(start), pattern);
-    return p ? std::optional(start + *p) : std::nullopt;
+namespace {
+DWORD extent(const IMAGE_SECTION_HEADER &s) {
+    return std::max(s.Misc.VirtualSize, s.SizeOfRawData);
 }
+void validateLayout(const PEImage &pe, std::span<const BYTE> bytes) {
+    if (pe.sections.empty() || pe.sections.size() > 96)
+        throw std::runtime_error("Invalid PE section count");
+    const auto &oh = pe.nt.OptionalHeader;
+    bounds(bytes.size(), 0, oh.SizeOfHeaders);
+    if (std::uint64_t(pe.ntOffset) + sizeof(pe.nt) + pe.sections.size() * sizeof(IMAGE_SECTION_HEADER) >
+        oh.SizeOfHeaders)
+        throw std::runtime_error("Section headers exceed SizeOfHeaders");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> raw, virtualRanges;
+    for (const auto &s : pe.sections) {
+        const auto &h = s.header;
+        if (h.VirtualAddress % oh.SectionAlignment || h.SizeOfRawData % oh.FileAlignment ||
+            (h.SizeOfRawData && h.PointerToRawData % oh.FileAlignment))
+            throw std::runtime_error("Unaligned PE section");
+        if (extent(h)) {
+            auto end = pe.sectionAlign(rva32(std::uint64_t(h.VirtualAddress) + extent(h)));
+            if (h.VirtualAddress < pe.sectionAlign(oh.SizeOfHeaders) || end > oh.SizeOfImage)
+                throw std::runtime_error("Section outside image bounds");
+            virtualRanges.emplace_back(h.VirtualAddress, end);
+        }
+        if (h.SizeOfRawData) {
+            bounds(bytes.size(), h.PointerToRawData, h.SizeOfRawData);
+            if (h.PointerToRawData < oh.SizeOfHeaders)
+                throw std::runtime_error("Section overlaps PE headers");
+            raw.emplace_back(h.PointerToRawData, std::uint64_t(h.PointerToRawData) + h.SizeOfRawData);
+        }
+        if (h.PointerToRelocations || h.PointerToLinenumbers || h.NumberOfRelocations ||
+            h.NumberOfLinenumbers)
+            throw std::runtime_error("COFF section relocation/line metadata is not supported for rewriting");
+    }
+    for (auto *ranges : {&raw, &virtualRanges}) {
+        std::sort(ranges->begin(), ranges->end());
+        for (std::size_t i = 1; i < ranges->size(); ++i)
+            if ((*ranges)[i].first < (*ranges)[i - 1].second)
+                throw std::runtime_error("Overlapping PE sections");
+    }
+}
+void validateEntryAndTLS(const PEImage &pe, std::span<const BYTE> bytes) {
+    auto executable = [&](DWORD rva) {
+        auto idx = pe.sectionAt(rva);
+        return idx && (pe.sections[*idx].header.Characteristics & IMAGE_SCN_MEM_EXECUTE);
+    };
+    if (pe.nt.OptionalHeader.AddressOfEntryPoint && !executable(pe.nt.OptionalHeader.AddressOfEntryPoint))
+        throw std::runtime_error("Section layout would make the entry point non-executable");
+    const auto &dir = pe.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (pe.nt.OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_TLS || !dir.VirtualAddress)
+        return;
+    if (dir.Size < sizeof(IMAGE_TLS_DIRECTORY))
+        throw std::runtime_error("Truncated TLS directory");
+    auto tls =
+        load<IMAGE_TLS_DIRECTORY>(bytes, pe.fileOffset(dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY)));
+    auto toRVA = [&](std::uint64_t va) {
+        if (va < pe.nt.OptionalHeader.ImageBase ||
+            va - pe.nt.OptionalHeader.ImageBase >= pe.nt.OptionalHeader.SizeOfImage)
+            throw std::runtime_error("TLS VA outside image");
+        return rva32(va - pe.nt.OptionalHeader.ImageBase);
+    };
+    if (tls.AddressOfIndex) {
+        auto rva = toRVA(tls.AddressOfIndex);
+        auto idx = pe.sectionAt(rva);
+        if (!idx || !(pe.sections[*idx].header.Characteristics & IMAGE_SCN_MEM_WRITE) ||
+            std::uint64_t(rva) + sizeof(DWORD) >
+                std::uint64_t(pe.sections[*idx].header.VirtualAddress) + extent(pe.sections[*idx].header))
+            throw std::runtime_error("Section layout would make the TLS index unwritable");
+    }
+    if (tls.AddressOfCallBacks) {
+        auto rva = toRVA(tls.AddressOfCallBacks);
+        for (unsigned i = 0; i < 1024; ++i) {
+            auto callback = load<Address>(
+                bytes, pe.fileOffset(rva32(std::uint64_t(rva) + i * sizeof(Address)), sizeof(Address)));
+            if (!callback)
+                return;
+            if (!executable(toRVA(callback)))
+                throw std::runtime_error("Section layout would make a TLS callback non-executable");
+        }
+        throw std::runtime_error("Unterminated TLS callback table");
+    }
+}
+void updateSizes(PEImage &pe) {
+    std::uint64_t code = 0, initialized = 0, uninitialized = 0;
+    for (const auto &s : pe.sections) {
+        auto &h = s.header;
+        if (h.Characteristics & IMAGE_SCN_CNT_CODE)
+            code += h.SizeOfRawData;
+        if (h.Characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA)
+            initialized += h.SizeOfRawData;
+        if (h.Characteristics & (IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_CNT_UNINITIALIZED_DATA))
+            uninitialized += extent(h) - h.SizeOfRawData;
+    }
+    pe.nt.OptionalHeader.SizeOfCode = rva32(code);
+    pe.nt.OptionalHeader.SizeOfInitializedData = rva32(initialized);
+    pe.nt.OptionalHeader.SizeOfUninitializedData = rva32(uninitialized);
+}
+} // namespace
 void Patcher::save() {
     pe_.nt.OptionalHeader.CheckSum = 0;
+    // Rewriting headers invalidates Authenticode. Preserve any overlay bytes,
+    // but do not claim that the original certificate still authenticates them.
+    pe_.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {};
+    updateSizes(pe_);
     pe_.save(data_);
+    validateLayout(pe_, data_);
     writeFileAtomic(path_, data_);
 }
-void Patcher::createData() {
-    if (lower(path_.filename().wstring()).find(L"maplestory") != std::wstring::npos)
-        createMaple();
-    else if (pe_.nt.OptionalHeader.MajorLinkerVersion == 14)
-        createMSVC();
-    else {
-        log(log_, LogType::Info, L"Data section creation not available for this compiler.");
-        return;
+void Patcher::applyLayout(const PEImage &layout) {
+    validateLayout(pe_, data_);
+    if (layout.nt.FileHeader.Machine != pe_.nt.FileHeader.Machine ||
+        layout.nt.OptionalHeader.SectionAlignment != pe_.nt.OptionalHeader.SectionAlignment)
+        throw std::runtime_error("Reference architecture/section alignment differs from target");
+    std::vector<std::vector<Section>> references(pe_.sections.size());
+    for (const auto &ref : layout.sections) {
+        const auto &h = ref.header;
+        if (!extent(h))
+            continue;
+        auto parent = pe_.sectionAt(h.VirtualAddress);
+        if (!parent || h.VirtualAddress % pe_.nt.OptionalHeader.SectionAlignment)
+            throw std::runtime_error("Reference section is not mapped in target");
+        const auto &source = pe_.sections[*parent].header;
+        if (std::uint64_t(h.VirtualAddress) + extent(h) >
+            std::uint64_t(source.VirtualAddress) + extent(source))
+            throw std::runtime_error(
+                "Reference section crosses target section boundary (different layout/build)");
+        references[*parent].push_back(ref);
     }
-    save();
-}
-void Patcher::split(DWORD rdata, DWORD data, DWORD end, DWORD zeroSize) {
-    if (pe_.sections.size() < 2)
-        throw std::runtime_error("Too few sections for split");
-    const auto old = pe_.sections.front().header;
-    const auto limit = pe_.sections[1].header.VirtualAddress;
-    if (old.PointerToRawData != old.VirtualAddress || pe_.sections[1].header.PointerToRawData != limit ||
-        rdata <= old.VirtualAddress || data <= rdata || end < data || end > limit || zeroSize > end - data)
-        throw std::runtime_error("Invalid data section boundaries (requires a memory-layout dump)");
-    auto make = [](std::string_view name, DWORD begin, DWORD len, bool writable) {
-        Section s;
-        s.rename(name);
-        s.header.VirtualAddress = begin;
-        s.header.PointerToRawData = begin;
-        s.header.Misc.VirtualSize = len;
-        s.header.SizeOfRawData = len;
-        s.header.Characteristics =
-            IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA | (writable ? IMAGE_SCN_MEM_WRITE : 0);
-        return s;
-    };
-    std::vector<Section> added{make(".rdata", rdata, data - rdata, false),
-                               make(".data", data, end - data, true)};
-    added[1].header.SizeOfRawData -= zeroSize;
-    if (end < limit)
-        added.push_back(
-            make(pe_.nt.OptionalHeader.MajorLinkerVersion >= 14 ? ".gfids" : ".vmp", end, limit - end, true));
-    pe_.sections.insert(pe_.sections.begin() + 1, added.begin(), added.end());
-    auto &text = pe_.sections.front();
-    text.rename(".text");
-    text.header.Misc.VirtualSize = rdata - old.VirtualAddress;
-    text.header.SizeOfRawData = text.header.Misc.VirtualSize;
-    text.header.Characteristics &= ~IMAGE_SCN_MEM_WRITE;
-}
-void Patcher::createMSVC() {
-    auto start = pe_.nt.OptionalHeader.BaseOfData;
-    auto &text = pe_.sections.front().header;
-    if (start <= text.VirtualAddress || start >= std::uint64_t(text.VirtualAddress) + text.Misc.VirtualSize ||
-        (start & 0xfff)) {
-        log(log_, LogType::Info, L"Assuming sections are not merged.");
-        pe_.sections.front().rename(".text");
-        text.Characteristics &= ~IMAGE_SCN_MEM_WRITE;
-        return;
+    auto result = pe_;
+    result.sections.clear();
+    for (std::size_t i = 0; i < pe_.sections.size(); ++i) {
+        const auto &source = pe_.sections[i];
+        const auto &h = source.header;
+        auto &refs = references[i];
+        if (refs.empty()) {
+            result.sections.push_back(source);
+            continue;
+        }
+        std::sort(refs.begin(), refs.end(), [](const auto &a, const auto &b) {
+            return a.header.VirtualAddress < b.header.VirtualAddress;
+        });
+        DWORD end = rva32(std::uint64_t(h.VirtualAddress) + extent(h));
+        DWORD cursor = h.VirtualAddress;
+        auto append = [&](DWORD begin, DWORD limit, const Section *ref) {
+            if (begin == limit)
+                return;
+            Section part = ref ? *ref : source;
+            if (!ref)
+                part.rename(".keep");
+            auto delta = begin - h.VirtualAddress;
+            part.header.VirtualAddress = begin;
+            part.header.Misc.VirtualSize = limit - begin;
+            part.header.SizeOfRawData =
+                delta < h.SizeOfRawData ? std::min(h.SizeOfRawData - delta, limit - begin) : 0;
+            part.header.PointerToRawData =
+                part.header.SizeOfRawData ? rva32(std::uint64_t(h.PointerToRawData) + delta) : 0;
+            // A live dump's former BSS can contain initialized state. Never
+            // discard those bytes just because the reference called it BSS.
+            if (part.header.SizeOfRawData &&
+                (part.header.Characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA)) {
+                part.header.Characteristics &= ~IMAGE_SCN_CNT_UNINITIALIZED_DATA;
+                part.header.Characteristics |= IMAGE_SCN_CNT_INITIALIZED_DATA;
+            }
+            result.sections.push_back(part);
+        };
+        for (const auto &ref : refs) {
+            auto begin = ref.header.VirtualAddress;
+            if (begin < cursor)
+                throw std::runtime_error("Overlapping reference sections");
+            append(cursor, begin, nullptr);
+            cursor = std::min(end, pe_.sectionAlign(rva32(std::uint64_t(begin) + extent(ref.header))));
+            append(begin, cursor, &ref);
+        }
+        append(cursor, end, nullptr);
     }
-    auto p = find("8BF033FF393E74??56E8", 0x1000);
-    if (!p || *p < 5 || data_[*p - 5] != 0xe8)
-        throw std::runtime_error("MSVC dynamic TLS sequence not found");
-    auto fn = static_cast<std::int64_t>(*p) + load<std::int32_t>(data_, *p - 4);
-    if (fn < 0)
-        throw std::runtime_error("Invalid TLS callback getter");
-    if (load<BYTE>(data_, static_cast<std::size_t>(fn)) == 0xe9)
-        fn += load<std::int32_t>(data_, static_cast<std::size_t>(fn) + 1) + 5;
-    if (fn < 0 || load<BYTE>(data_, static_cast<std::size_t>(fn)) != 0xb8)
-        throw std::runtime_error("MSVC TLS getter mismatch");
-    auto va = load<DWORD>(data_, static_cast<std::size_t>(fn) + 1);
-    if (va < pe_.nt.OptionalHeader.ImageBase)
-        throw std::runtime_error("Invalid TLS pointer");
-    DWORD tls = va - pe_.nt.OptionalHeader.ImageBase;
-    if (!load<DWORD>(data_, pe_.fileOffset(tls, 4)))
-        tls = 0;
-    auto data = tls ? (tls + 0x1000) & ~DWORD(0xfff) : start + 0x1000;
-    split(start, data, pe_.sections.at(1).header.VirtualAddress);
-}
-void Patcher::createMaple() {
-    auto start = find("10000000200000004000000060000000", 0x2000000);
-    if (!start && pe_.nt.OptionalHeader.MajorLinkerVersion == 6) {
-        auto p = find("68????????68??????00E8????????83C410C3", 0x100000);
-        if (p) {
-            auto va = load<DWORD>(data_, *p + 6);
-            if (va >= pe_.nt.OptionalHeader.ImageBase && !(va & 0xfff))
-                start = va - pe_.nt.OptionalHeader.ImageBase;
+    auto oldEnd =
+        std::size_t(pe_.ntOffset) + sizeof(pe_.nt) + pe_.sections.size() * sizeof(IMAGE_SECTION_HEADER);
+    auto newEnd =
+        std::size_t(pe_.ntOffset) + sizeof(pe_.nt) + result.sections.size() * sizeof(IMAGE_SECTION_HEADER);
+    if (newEnd > pe_.nt.OptionalHeader.SizeOfHeaders)
+        throw std::runtime_error("No room for additional section headers");
+    if (newEnd > oldEnd) {
+        if (!std::all_of(data_.begin() + oldEnd, data_.begin() + newEnd, [](BYTE b) { return b == 0; }))
+            throw std::runtime_error("New section headers would overwrite existing header data");
+        for (unsigned i = 0; i < pe_.nt.OptionalHeader.NumberOfRvaAndSizes; ++i) {
+            const auto &d = pe_.nt.OptionalHeader.DataDirectory[i];
+            if (i != IMAGE_DIRECTORY_ENTRY_SECURITY && d.VirtualAddress && d.VirtualAddress < newEnd &&
+                std::uint64_t(d.VirtualAddress) + std::max(DWORD(1), d.Size) > oldEnd)
+                throw std::runtime_error("New section headers overlap a PE data directory");
         }
     }
-    if (!start) {
-        auto a = find("2E3F41565F636F6D5F6572726F724040", 0x700000);
-        auto b = find("2E3F41563F245A4C69737440554D4150494E464F4043416374696F6E4672616D6540404040", 0x700000);
-        if (b && (!a || *b < *a))
-            a = b;
-        if (a && *a >= 8) {
-            start = *a - 8;
-            auto rem = *start & 0xfff;
-            if (rem == 0xb4 || rem == 0xf8 || rem == 0xfc)
-                *start &= ~std::size_t(0xfff);
+    validateLayout(result, data_);
+    validateEntryAndTLS(result, data_);
+    pe_ = std::move(result);
+}
+bool Patcher::createData(const Path &reference) {
+    if (!reference.empty()) {
+        auto bytes = readFile(reference);
+        PEImage layout(bytes);
+        validateLayout(layout, bytes);
+        applyLayout(layout);
+        save();
+        log(log_, LogType::Good,
+            L"Section layout applied from reference; RVAs and target payload retained. Reference must be "
+            L"from the same build.");
+        return true;
+    }
+#ifndef _WIN64
+    auto boundary = pe_.nt.OptionalHeader.BaseOfData;
+    auto idx = pe_.sectionAt(boundary);
+    if (idx && boundary % pe_.nt.OptionalHeader.SectionAlignment == 0) {
+        const auto &old = pe_.sections[*idx];
+        auto delta = boundary - old.header.VirtualAddress;
+        auto ep = pe_.nt.OptionalHeader.AddressOfEntryPoint;
+        if (delta && delta < extent(old.header) && (old.header.Characteristics & IMAGE_SCN_MEM_EXECUTE) &&
+            !(ep >= boundary &&
+              std::uint64_t(ep) < std::uint64_t(old.header.VirtualAddress) + extent(old.header))) {
+            auto layout = pe_;
+            layout.sections = {old, old};
+            auto &text = layout.sections[0];
+            text.rename(".text");
+            text.header.Misc.VirtualSize = delta;
+            text.header.SizeOfRawData = std::min(delta, old.header.SizeOfRawData);
+            auto &data = layout.sections[1];
+            data.rename(".data");
+            data.header.VirtualAddress = boundary;
+            data.header.Misc.VirtualSize = extent(old.header) - delta;
+            data.header.SizeOfRawData =
+                delta < old.header.SizeOfRawData ? old.header.SizeOfRawData - delta : 0;
+            data.header.Characteristics = (old.header.Characteristics & ~IMAGE_SCN_CNT_CODE) |
+                                          IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ |
+                                          IMAGE_SCN_MEM_WRITE;
+            applyLayout(layout);
+            save();
+            log(log_, LogType::Good,
+                L"Split at PE32 BaseOfData. Existing executable permissions retained; no .rdata boundary "
+                L"guessed.");
+            return true;
         }
     }
-    if (!start || (*start & 0xfff))
-        throw std::runtime_error("MapleStory .data boundary not found/aligned");
-    auto limit = pe_.sections.at(1).header.PointerToRawData;
-    bounds(data_.size(), *start, limit - *start);
-    std::size_t zeroEnd{}, zeroSize{}, pos = limit;
-    while (pos > *start) {
-        --pos;
-        if (!data_[pos]) {
-            if (!zeroSize)
-                zeroEnd = pos + 1;
-            ++zeroSize;
-        } else {
-            if (zeroSize > 0x2000)
-                break;
-            zeroSize = 0;
-        }
-    }
-    if (!zeroSize)
-        throw std::runtime_error("MapleStory zero-filled .data tail not found");
-    if ((zeroEnd & 0xfff) == 1) {
-        --zeroEnd;
-        --zeroSize;
-    }
-    if (zeroEnd & 0xfff)
-        throw std::runtime_error("MapleStory .data end not aligned");
-    auto zeroStart = alignUp(rva32(zeroEnd - zeroSize), 0x1000);
-    split(pe_.nt.OptionalHeader.BaseOfData, rva32(*start), rva32(zeroEnd), rva32(zeroEnd - zeroStart));
+#endif
+    log(log_, LogType::Info,
+        L"No safe automatic data split available (or sections already separated). File unchanged; use a "
+        L"same-build reference PE to restore .rdata/.data permissions.");
+    return false;
 }
 void Patcher::shrink() {
-    auto &oh = pe_.nt.OptionalHeader;
-    Bytes result(data_.begin(), data_.begin() + std::min<std::size_t>(data_.size(), oh.SizeOfHeaders));
-    std::vector<Section> kept;
+    validateLayout(pe_, data_);
+    if (pe_.nt.FileHeader.PointerToSymbolTable || pe_.nt.FileHeader.NumberOfSymbols)
+        throw std::runtime_error("COFF symbol table present; refusing unsupported raw-file rewrite");
+    const auto original = pe_;
+    auto oldOverlay = std::size_t(pe_.nt.OptionalHeader.SizeOfHeaders);
+    for (const auto &s : original.sections)
+        if (s.header.SizeOfRawData)
+            oldOverlay = std::max<std::size_t>(oldOverlay, std::size_t(s.header.PointerToRawData) +
+                                                               s.header.SizeOfRawData);
+    std::vector<std::pair<std::size_t, std::size_t>> ranges;
+    for (const auto &section : original.sections)
+        if (section.header.SizeOfRawData)
+            ranges.emplace_back(section.header.PointerToRawData,
+                                std::size_t(section.header.PointerToRawData) + section.header.SizeOfRawData);
+    std::sort(ranges.begin(), ranges.end());
+    std::size_t previous = original.nt.OptionalHeader.SizeOfHeaders;
+    for (const auto &[begin, end] : ranges) {
+        if (!std::all_of(data_.begin() + previous, data_.begin() + begin, [](BYTE b) { return b == 0; }))
+            throw std::runtime_error(
+                "Nonzero data in raw-file gaps; refusing to discard unclassified metadata");
+        previous = end;
+    }
+    const auto debug = pe_.nt.OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG
+                           ? pe_.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG]
+                           : IMAGE_DATA_DIRECTORY{};
+    std::vector<IMAGE_DEBUG_DIRECTORY> debugEntries;
+    if (debug.VirtualAddress) {
+        if (debug.Size % sizeof(IMAGE_DEBUG_DIRECTORY))
+            throw std::runtime_error("Invalid debug directory size");
+        auto off = pe_.fileOffset(debug.VirtualAddress, debug.Size);
+        for (std::size_t i = 0; i < debug.Size / sizeof(IMAGE_DEBUG_DIRECTORY); ++i)
+            debugEntries.push_back(
+                load<IMAGE_DEBUG_DIRECTORY>(data_, off + i * sizeof(IMAGE_DEBUG_DIRECTORY)));
+    }
+    Bytes packed(data_.begin(), data_.begin() + pe_.nt.OptionalHeader.SizeOfHeaders);
     for (std::size_t i = 0; i < pe_.sections.size(); ++i) {
-        auto s = pe_.sections[i];
-        auto &h = s.header;
-        bool keep = i == 0 || s.name() == ".data" || s.name() == ".rdata";
-        for (unsigned j = 0; j < oh.NumberOfRvaAndSizes; ++j) {
-            auto d = oh.DataDirectory[j];
-            if (j != IMAGE_DIRECTORY_ENTRY_SECURITY && d.Size && d.VirtualAddress >= h.VirtualAddress &&
-                std::uint64_t(d.VirtualAddress) + d.Size <=
-                    std::uint64_t(h.VirtualAddress) + h.Misc.VirtualSize)
-                keep = true;
+        auto &h = pe_.sections[i].header;
+        auto old = h;
+        DWORD n = h.SizeOfRawData;
+        while (n && data_[h.PointerToRawData + n - 1] == 0)
+            --n;
+        // Debug records contain file offsets, not just RVAs. Retain their full
+        // data, including zero tails, and fix up pointers after repacking.
+        for (const auto &entry : debugEntries)
+            if (entry.PointerToRawData >= old.PointerToRawData &&
+                std::uint64_t(entry.PointerToRawData) + entry.SizeOfData <=
+                    std::uint64_t(old.PointerToRawData) + old.SizeOfRawData)
+                n = std::max(n, entry.PointerToRawData - old.PointerToRawData + entry.SizeOfData);
+        if (debug.VirtualAddress >= old.VirtualAddress &&
+            std::uint64_t(debug.VirtualAddress) + debug.Size <=
+                std::uint64_t(old.VirtualAddress) + old.SizeOfRawData)
+            n = std::max(n, debug.VirtualAddress - old.VirtualAddress + debug.Size);
+        h.Misc.VirtualSize = extent(old); // trimmed raw zeros remain mapped zeros
+        h.SizeOfRawData = pe_.fileAlign(n);
+        h.PointerToRawData = h.SizeOfRawData ? pe_.fileAlign(rva32(packed.size())) : 0;
+        if (h.SizeOfRawData) {
+            packed.resize(h.PointerToRawData);
+            packed.insert(packed.end(), data_.begin() + old.PointerToRawData,
+                          data_.begin() + old.PointerToRawData + h.SizeOfRawData);
         }
-        if (!keep)
-            continue;
-        bounds(data_.size(), h.PointerToRawData, h.SizeOfRawData);
-        auto next = pe_.fileAlign(rva32(result.size()));
-        result.resize(next);
-        result.insert(result.end(), data_.begin() + h.PointerToRawData,
-                      data_.begin() + h.PointerToRawData + h.SizeOfRawData);
-        h.PointerToRawData = next;
-        kept.push_back(s);
     }
-    if (kept.empty())
-        throw std::runtime_error("No sections retained");
-    pe_.sections = std::move(kept);
-    data_ = std::move(result);
-    oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {};
-    shrinkExports();
-    save();
-}
-void Patcher::shrinkExports() {
-    auto &dir = pe_.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (!dir.VirtualAddress || !dir.Size)
-        return;
-    auto idx = pe_.sectionAt(dir.VirtualAddress);
-    if (!idx)
-        return;
-    auto &s = pe_.sections[*idx];
-    auto &h = s.header;
-    auto newSize = pe_.fileAlign(dir.Size);
-    if (newSize >= h.SizeOfRawData)
-        return;
-    // Only compact a dedicated export section; don't discard unrelated directories.
-    for (unsigned i = 1; i < IMAGE_NUMBEROF_DIRECTORY_ENTRIES; ++i) {
-        auto d = pe_.nt.OptionalHeader.DataDirectory[i];
-        if (i != IMAGE_DIRECTORY_ENTRY_SECURITY && d.Size && pe_.sectionAt(d.VirtualAddress) == idx)
-            return;
-    }
-    auto off = pe_.fileOffset(dir.VirtualAddress, dir.Size);
-    bounds(data_.size(), off, dir.Size);
-    Bytes exports(data_.begin() + off, data_.begin() + off + dir.Size);
-    auto e = load<IMAGE_EXPORT_DIRECTORY>(exports, 0);
-    auto oldRva = dir.VirtualAddress;
-    auto delta = oldRva - h.VirtualAddress;
-    auto adjust = [&](DWORD v) {
-        if (v < oldRva || v - oldRva >= dir.Size)
-            throw std::runtime_error("Export data outside directory");
-        return v - delta;
+    auto newOverlay = packed.size();
+    packed.insert(packed.end(), data_.begin() + oldOverlay, data_.end());
+    auto remap = [&](DWORD offset, DWORD size) -> DWORD {
+        bounds(data_.size(), offset, size);
+        if (offset >= oldOverlay)
+            return rva32(newOverlay + (offset - oldOverlay));
+        if (offset < original.nt.OptionalHeader.SizeOfHeaders) {
+            bounds(original.nt.OptionalHeader.SizeOfHeaders, offset, size);
+            return offset;
+        }
+        for (std::size_t i = 0; i < original.sections.size(); ++i) {
+            const auto &old = original.sections[i].header;
+            if (offset >= old.PointerToRawData &&
+                std::uint64_t(offset) + size <= std::uint64_t(old.PointerToRawData) + old.SizeOfRawData) {
+                auto delta = offset - old.PointerToRawData;
+                bounds(pe_.sections[i].header.SizeOfRawData, delta, size);
+                return rva32(std::uint64_t(pe_.sections[i].header.PointerToRawData) + delta);
+            }
+        }
+        throw std::runtime_error("Debug raw pointer outside retained file ranges");
     };
-    e.Name = adjust(e.Name);
-    auto namesOffset = e.AddressOfNames - oldRva, functionsOffset = e.AddressOfFunctions - oldRva;
-    e.AddressOfFunctions = adjust(e.AddressOfFunctions);
-    e.AddressOfNames = adjust(e.AddressOfNames);
-    e.AddressOfNameOrdinals = adjust(e.AddressOfNameOrdinals);
-    for (DWORD i = 0; i < e.NumberOfNames; ++i) {
-        auto p = namesOffset + i * 4;
-        store(exports, p, adjust(load<DWORD>(exports, p)));
+    if (debug.VirtualAddress) {
+        auto off = pe_.fileOffset(debug.VirtualAddress, debug.Size);
+        for (std::size_t i = 0; i < debugEntries.size(); ++i) {
+            auto entry = debugEntries[i];
+            if (entry.PointerToRawData)
+                entry.PointerToRawData = remap(entry.PointerToRawData, entry.SizeOfData);
+            store(packed, off + i * sizeof(entry), entry);
+        }
     }
-    for (DWORD i = 0; i < e.NumberOfFunctions; ++i) {
-        auto p = functionsOffset + i * 4;
-        auto v = load<DWORD>(exports, p);
-        if (v >= oldRva && v - oldRva < dir.Size)
-            store(exports, p, v - delta);
-    }
-    store(exports, 0, e);
-    exports.resize(newSize);
-    auto removed = h.SizeOfRawData - newSize;
-    bounds(data_.size(), h.PointerToRawData, h.SizeOfRawData);
-    std::copy(exports.begin(), exports.end(), data_.begin() + h.PointerToRawData);
-    data_.erase(data_.begin() + h.PointerToRawData + newSize,
-                data_.begin() + h.PointerToRawData + h.SizeOfRawData);
-    for (std::size_t i = *idx + 1; i < pe_.sections.size(); ++i)
-        pe_.sections[i].header.PointerToRawData -= removed;
-    h.SizeOfRawData = newSize;
-    h.Characteristics &= ~(IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE);
-    s.rename(".export");
-    dir.VirtualAddress = h.VirtualAddress;
+    data_ = std::move(packed);
+    save();
+    log(log_, LogType::Good,
+        L"Compacted raw padding/zero tails; all sections, virtual extents and overlay retained. No VM "
+        L"section removed.");
 }
 void Patcher::dumpProcess(DWORD pid) {
+    validateLayout(pe_, data_);
     Handle p(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid));
     if (!p)
         winError("OpenProcess");
     Handle snap(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid));
     if (!snap)
         winError("CreateToolhelp32Snapshot");
-    MODULEENTRY32W m{};
-    m.dwSize = sizeof(m);
-    check(Module32FirstW(snap.get(), &m), "Module32First");
-    auto &h = pe_.sections.front().header;
-    auto end = pe_.nt.OptionalHeader.BaseOfData;
-    if (end <= h.VirtualAddress)
-        throw std::runtime_error("Invalid code range");
-    auto code = readMemory(p.get(), reinterpret_cast<Address>(m.modBaseAddr) + h.VirtualAddress,
-                           end - h.VirtualAddress);
-    bounds(data_.size(), h.PointerToRawData, code.size());
-    std::copy(code.begin(), code.end(), data_.begin() + h.PointerToRawData);
-    auto out = path_;
-    out.replace_extension(L".novm.exe");
-    writeFileAtomic(out, data_);
-    log(log_, LogType::Good, L"Dumped code to " + out.wstring());
+    MODULEENTRY32W module{};
+    module.dwSize = sizeof(module);
+    check(Module32FirstW(snap.get(), &module), "Module32First");
+    auto base = reinterpret_cast<Address>(module.modBaseAddr);
+    PEImage remote(readPEHeader(p.get(), base));
+    if (remote.nt.FileHeader.TimeDateStamp != pe_.nt.FileHeader.TimeDateStamp)
+        throw std::runtime_error("Process and file PE timestamps differ; choose the matching target");
+    bool copied = false;
+    for (const auto &s : pe_.sections) {
+        const auto &h = s.header;
+        if (!(h.Characteristics & IMAGE_SCN_MEM_EXECUTE) || !h.SizeOfRawData)
+            continue;
+        bounds(remote.nt.OptionalHeader.SizeOfImage, h.VirtualAddress, h.SizeOfRawData);
+        auto bytes = readMemory(p.get(), base + h.VirtualAddress, h.SizeOfRawData);
+        std::copy(bytes.begin(), bytes.end(), data_.begin() + h.PointerToRawData);
+        copied = true;
+    }
+    if (!copied)
+        throw std::runtime_error("No file-backed executable sections to copy");
+    pe_.nt.OptionalHeader.CheckSum = 0;
+    pe_.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_SECURITY] = {};
+    pe_.save(data_);
+    auto output = path_.parent_path() / (path_.stem().wstring() + L".novm" + path_.extension().wstring());
+    writeFileAtomic(output, data_);
+    log(log_, LogType::Good,
+        L"Copied executable section bytes to " + output.wstring() + L"; this does not devirtualize code.");
 }
-#endif
 } // namespace mm

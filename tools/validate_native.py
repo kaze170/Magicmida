@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Offline project/data completeness checks; does not claim to compile with MSVC."""
 from pathlib import Path
+import hashlib
+import json
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -61,23 +64,29 @@ def main():
     require(own_headers <= all_headers, f'Unlisted native/test headers: {own_headers - all_headers}')
     common = ET.parse(ROOT / 'Native.Common.props').getroot()
     require(common.findtext('m:ItemDefinitionGroup/m:ClCompile/m:LanguageStandard', namespaces=NS) == 'stdcpplatest', 'C++26 preview flag')
-    pascal = (ROOT / 'OneCoreUAP.pas').read_text()
+    baseline = json.loads((ROOT / 'tools/native-baseline.json').read_text())
     cpp = (ROOT / 'native/OneCoreUAP.cpp').read_text()
-    old_pairs = re.findall(r"^\('([^']+)',\s*'([^']+)'\)", pascal, re.M)
-    new_pairs = re.findall(r'\{"([^"\\]+)",\s*"([^"\\]+)"\}', cpp)
-    require(len(old_pairs) == 3003 and old_pairs == new_pairs, 'OneCore table differs from Pascal')
-    require(len(dict(old_pairs)) == 3003, 'duplicate OneCore APIs')
+    pairs = re.findall(r'\{"([^"\\]+)",\s*"([^"\\]+)"\}', cpp)
+    digest = hashlib.sha256('\n'.join(api + '\t' + dll for api, dll in pairs).encode('utf-8')).hexdigest()
+    require(len(pairs) == baseline['onecore_count'] == 3003, 'OneCore mapping count')
+    require(digest == baseline['onecore_sha256'], 'OneCore mapping differs from audited baseline')
+    require(len(dict(pairs)) == 3003, 'duplicate OneCore APIs')
     native = '\n'.join(p.read_text() for p in (ROOT / 'native').glob('*.cpp'))
-    patterns = set()
-    for file in ('Themida.pas', 'Patcher.pas'):
-        patterns.update(re.findall(r"Find(?:Dynamic|Static)(?:TM)?\('([0-9A-F?]+)'", (ROOT / file).read_text()))
+    patterns = baseline['unpacker_signatures']
     for pattern in patterns:
-        require(f'"{pattern}"' in native, f'Unported search signature: {pattern}')
+        require(f'"{pattern}"' in native, f'Missing unpacker signature: {pattern}')
+    forbidden = {'.pas', '.dpr', '.dproj', '.dfm', '.lpi', '.lpr', '.lps', '.obj', '.res'}
+    for directory, folders, files in os.walk(ROOT):
+        folders[:] = [f for f in folders if f not in {'.git', '.cache', 'artifacts', '.vs', '__pycache__'}]
+        for file in files:
+            require(Path(file).suffix.lower() not in forbidden, f'Non-native source/prebuilt artifact remains: {Path(directory) / file}')
+    for asset in re.findall(r'ICON "([^"\n]+)"', (ROOT / 'native/Magicmida.rc').read_text()):
+        require((ROOT / 'native' / asset).is_file(), f'Missing resource asset: {asset}')
     require('BEA_ENGINE_STATIC' in (ROOT / 'Native.Common.props').read_text(), 'BeaEngine ABI setting')
     for license in ('LICENSE', 'third_party/beaengine/src/COPYING.txt', 'third_party/beaengine/src/COPYING.LESSER.txt'):
         require((ROOT / license).is_file(), f'Missing license: {license}')
     print(f'PASS: {len(projects)} projects, 4 configurations each, {len(own_sources)} C++ sources, '
-          f'3,003 API mappings, {len(patterns)} legacy search signatures, licenses and filters')
+          f'3,003 API mappings, {len(patterns)} unpacker signatures, licenses and filters')
 
 
 if __name__ == '__main__':

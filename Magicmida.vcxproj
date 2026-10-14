@@ -16,7 +16,13 @@
   <ItemDefinitionGroup><Link><SubSystem>Windows</SubSystem><EnableUAC>false</EnableUAC></Link></ItemDefinitionGroup>
   <ItemDefinitionGroup><Manifest><AdditionalManifestFiles>$(ProjectDir)native\Magicmida.manifest;%(AdditionalManifestFiles)</AdditionalManifestFiles></Manifest></ItemDefinitionGroup>
   <ItemGroup><ResourceCompile Include="native\Magicmida.rc" /><Manifest Include="native\Magicmida.manifest" /></ItemGroup>
-  <ItemGroup><Content Include="scylla_hide.ini" /></ItemGroup>
+  <ItemGroup>
+    <Content Include="scylla_hide.ini" />
+    <Content Include="native\assets\application.ico" />
+    <Content Include="native\assets\information.ico" />
+    <Content Include="native\assets\success.ico" />
+    <Content Include="native\assets\error.ico" />
+  </ItemGroup>
   <ItemGroup>
     <ClCompile Include="native\Main.cpp" />
   </ItemGroup>

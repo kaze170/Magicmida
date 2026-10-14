@@ -2,25 +2,21 @@
 #pragma once
 #include "PEInfo.hpp"
 namespace mm {
-#ifndef _WIN64
 class Patcher {
     Path path_;
     Bytes data_;
     PEImage pe_;
     Logger log_;
-    std::optional<std::size_t> find(std::string_view pattern, std::size_t start) const;
-    void createMSVC();
-    void createMaple();
-    void split(DWORD rdata, DWORD data, DWORD end, DWORD zeroSize = 0);
-    void shrinkExports();
+    void applyLayout(const PEImage &layout);
     void save();
 
   public:
     Patcher(Path path, Logger log)
         : path_(std::move(path)), data_(readFile(path_)), pe_(data_), log_(std::move(log)) {}
-    void createData();
+    // Without a same-build reference, only a conservative PE32 BaseOfData split
+    // is possible. False means no change, not a successfully inferred layout.
+    bool createData(const Path &reference = {});
     void shrink();
     void dumpProcess(DWORD pid);
 };
-#endif
 } // namespace mm

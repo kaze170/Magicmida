@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Themida64.hpp"
+#include "Patcher.hpp"
 namespace mm {
 #ifdef _WIN64
 void Themida64::onStart() {
@@ -139,8 +140,10 @@ void Themida64::finish(Address oep) {
     traceImports(iat, d);
     auto output = unpackedPath(executable_);
     d.dump(output, iat, isDll_);
-    good(L"Saved " + output.wstring());
     terminateSuccess();
+    if (createData_)
+        Patcher(output, log_).createData();
+    good(L"Saved " + output.wstring());
 }
 #endif
 } // namespace mm

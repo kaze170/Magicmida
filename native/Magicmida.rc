@@ -3,10 +3,10 @@
 #include "resource.h"
 #pragma code_page(65001)
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
-IDI_MAGICMIDA ICON "../tree_2.ico"
-IDI_INFO ICON "../information.ico"
-IDI_GOOD ICON "../good_or_tick.ico"
-IDI_FATAL ICON "../fatal.ico"
+IDI_MAGICMIDA ICON "assets/application.ico"
+IDI_INFO ICON "assets/information.ico"
+IDI_GOOD ICON "assets/success.ico"
+IDI_FATAL ICON "assets/error.ico"
 IDD_PID DIALOGEX 0, 0, 220, 76
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Dump process code"

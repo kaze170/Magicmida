@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Validate solution, source inventory and Pascal data parity
+      - name: Validate native-only inventory, resources and audited data baseline
         run: python3 tools/validate_native.py
       - name: Build and run portable tests
         run: |

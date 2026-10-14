@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Test.hpp"
 #include "ThemidaCommon.hpp"
+#include "Patcher.hpp"
 #include <iostream>
 using namespace mm;
 namespace {
@@ -207,6 +208,246 @@ void fileTests() {
     test::require(unpackedPath(Path(L"C:\\space path\\target.dll")) == Path(L"C:\\space path\\targetU.dll"),
                   "U output suffix");
     test::require(widen(narrow(L"繁體中文 Δ")) == L"繁體中文 Δ", "UTF-8 roundtrip");
+}
+Bytes sectionFixture(bool reference) {
+    auto bytes = fixture();
+    PEImage pe(bytes);
+    pe.nt.OptionalHeader.SizeOfHeaders = 0x400;
+    pe.nt.OptionalHeader.SizeOfImage = 0x6000;
+    pe.nt.OptionalHeader.MajorLinkerVersion = 9; // not tied to MSVC14 or a game
+#ifndef _WIN64
+    pe.nt.OptionalHeader.BaseOfData = 0x2000;
+#endif
+    auto section = [](const char *name, DWORD va, DWORD raw, DWORD size, DWORD flags) {
+        Section s;
+        s.rename(name);
+        s.header.VirtualAddress = va;
+        s.header.PointerToRawData = raw;
+        s.header.Misc.VirtualSize = 0x1000;
+        s.header.SizeOfRawData = size;
+        s.header.Characteristics = flags;
+        return s;
+    };
+    constexpr DWORD code = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    constexpr DWORD read = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+    constexpr DWORD write = read | IMAGE_SCN_MEM_WRITE;
+    if (reference) {
+        pe.sections = {section(".text", 0x1000, 0x400, 0x200, code),
+                       section(".rdata", 0x2000, 0x600, 0x200, read),
+                       section(".data", 0x3000, 0x800, 0x200, write),
+                       section(".bss", 0x4000, 0, 0,
+                               IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE),
+                       section(".aux", 0x5000, 0xa00, 0x200, code)};
+        bytes.resize(0xc00);
+    } else {
+        auto merged = section(".merged", 0x1000, 0x400, 0x4000, code | IMAGE_SCN_MEM_WRITE);
+        merged.header.Misc.VirtualSize = 0x4000;
+        pe.sections = {merged, section(".aux", 0x5000, 0x4400, 0x200, code)};
+        bytes.resize(0x4600);
+        for (auto offset : {0x400, 0x1400, 0x2400, 0x3400, 0x4400})
+            bytes[offset] = BYTE(offset / 0x100);
+        bytes.insert(bytes.end(), {0xde, 0xad, 0xbe, 0xef}); // overlay must survive
+    }
+    pe.save(bytes);
+    return bytes;
+}
+Bytes mappedPayload(const Bytes &bytes) {
+    PEImage pe(bytes);
+    Bytes mapped(pe.nt.OptionalHeader.SizeOfImage);
+    for (const auto &s : pe.sections) {
+        bounds(bytes.size(), s.header.PointerToRawData, s.header.SizeOfRawData);
+        bounds(mapped.size(), s.header.VirtualAddress, s.header.SizeOfRawData);
+        std::copy_n(bytes.begin() + s.header.PointerToRawData, s.header.SizeOfRawData,
+                    mapped.begin() + s.header.VirtualAddress);
+    }
+    return mapped;
+}
+void patcherTests() {
+    TemporaryFolder folder;
+    auto target = folder.path / L"ordinary application.exe", ref = folder.path / L"same build reference.exe";
+    auto source = sectionFixture(false), reference = sectionFixture(true);
+    writeFileAtomic(target, source);
+    writeFileAtomic(ref, reference);
+    test::require(Patcher(target, {}).createData(ref), "reference layout supported on both architectures");
+    auto restored = readFile(target);
+    PEImage pe(restored);
+    test::require(pe.sections.size() == 5,
+                  "merged section restored into code, readonly, writable and BSS regions");
+    test::require(pe.sections[1].name() == ".rdata" && !(pe.sections[1].header.Characteristics &
+                                                         (IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_EXECUTE)),
+                  "reference readonly permissions restored");
+    test::require((pe.sections[2].header.Characteristics & IMAGE_SCN_MEM_WRITE) &&
+                      !(pe.sections[2].header.Characteristics & IMAGE_SCN_MEM_EXECUTE),
+                  "reference writable non-executable data restored");
+    test::require(pe.sections[3].header.SizeOfRawData == 0x1000 && restored[0x3400] == 0x34,
+                  "initialized former BSS is not discarded");
+    test::require(mappedPayload(source) == mappedPayload(restored),
+                  "reference split preserves all mapped bytes");
+    test::require(std::equal(source.begin() + 0x400, source.end(), restored.begin() + 0x400),
+                  "reference split changes no raw payload or overlay bytes");
+    test::require(Patcher(target, {}).createData(ref) && readFile(target) == restored,
+                  "reference restoration is idempotent");
+    auto renamed = folder.path / L"MapleStory.exe";
+    writeFileAtomic(renamed, source);
+    Patcher(renamed, {}).createData(ref);
+    test::require(readFile(renamed) == restored, "filename never selects reconstruction strategy");
+    Patcher(target, {}).shrink();
+    auto compact = readFile(target);
+    PEImage compactPE(compact);
+    test::require(compact.size() < restored.size(), "compaction reduces zero-padded file size");
+    test::require(compactPE.sections.size() == 5 && compactPE.sections.back().name() == ".aux",
+                  "compaction keeps executable sections without directory references");
+    test::require(mappedPayload(compact) == mappedPayload(restored),
+                  "compaction preserves complete virtual memory image");
+    test::require(std::equal(source.end() - 4, source.end(), compact.end() - 4),
+                  "compaction preserves overlay");
+    Patcher(target, {}).shrink();
+    test::require(readFile(target) == compact, "compaction is idempotent");
+    writeFileAtomic(target, source);
+#ifdef _WIN64
+    test::require(!Patcher(target, {}).createData() && readFile(target) == source,
+                  "PE32+ without reference must not invent data boundaries");
+#else
+    test::require(Patcher(target, {}).createData(),
+                  "PE32 BaseOfData works without compiler or filename assumptions");
+    auto automatic = readFile(target);
+    PEImage autoPE(automatic);
+    test::require(autoPE.sections.size() == 3 && autoPE.sections[1].header.VirtualAddress == 0x2000,
+                  "automatic split uses BaseOfData RVA with nonidentity raw offsets");
+    test::require(mappedPayload(automatic) == mappedPayload(source), "automatic split preserves bytes");
+    test::require(autoPE.sections[1].header.Characteristics & IMAGE_SCN_MEM_EXECUTE,
+                  "automatic split does not guess non-executable data permissions");
+    test::require(!Patcher(target, {}).createData() && readFile(target) == automatic,
+                  "already separated automatic layout is a no-op");
+#endif
+    auto rejectsLayout = [&](Bytes input, Bytes layout, const char *message) {
+        writeFileAtomic(target, input);
+        writeFileAtomic(ref, layout);
+        test::rejects([&] { Patcher(target, {}).createData(ref); }, message);
+        test::require(readFile(target) == input, "failed reconstruction leaves input file intact");
+    };
+    auto smallHeader = source;
+    PEImage small(smallHeader);
+    small.nt.OptionalHeader.SizeOfHeaders = 0x200;
+    small.save(smallHeader);
+    rejectsLayout(smallHeader, reference, "insufficient section header capacity rejected");
+    auto occupied = source;
+    PEImage occupiedPE(occupied);
+    auto headerEnd = std::size_t(occupiedPE.ntOffset) + sizeof(occupiedPE.nt) +
+                     occupiedPE.sections.size() * sizeof(IMAGE_SECTION_HEADER);
+    occupied[headerEnd] = 0x55;
+    rejectsLayout(occupied, reference, "nonzero header padding is not overwritten");
+    auto headerDir = source;
+    PEImage hd(headerDir);
+    hd.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE] = {rva32(headerEnd), 4};
+    hd.save(headerDir);
+    rejectsLayout(headerDir, reference, "even zero-filled header directories are protected");
+    auto overlap = reference;
+    PEImage overlapPE(overlap);
+    overlapPE.sections[1].header.VirtualAddress = 0x1000;
+    overlapPE.save(overlap);
+    rejectsLayout(source, overlap, "overlapping reference rejected");
+    auto outside = reference;
+    PEImage outsidePE(outside);
+    outsidePE.sections.back().header.VirtualAddress = 0x7000;
+    outsidePE.nt.OptionalHeader.SizeOfImage = 0x8000;
+    outsidePE.save(outside);
+    rejectsLayout(source, outside, "unmapped reference section rejected");
+    auto noExecute = reference;
+    PEImage nx(noExecute);
+    nx.sections.front().header.Characteristics &= ~IMAGE_SCN_MEM_EXECUTE;
+    nx.save(noExecute);
+    rejectsLayout(source, noExecute, "non-executable entry point rejected");
+    auto tlsSource = source;
+    PEImage tlsPE(tlsSource);
+    tlsPE.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = {0x2080, sizeof(IMAGE_TLS_DIRECTORY)};
+    IMAGE_TLS_DIRECTORY tls{};
+    tls.AddressOfIndex = tlsPE.nt.OptionalHeader.ImageBase + 0x3000;
+    tls.AddressOfCallBacks = tlsPE.nt.OptionalHeader.ImageBase + 0x2180;
+    store(tlsSource, 0x1480, tls);
+    store<Address>(tlsSource, 0x1580, Address(tlsPE.nt.OptionalHeader.ImageBase + 0x1000));
+    tlsPE.save(tlsSource);
+    auto readonlyIndex = reference;
+    PEImage ri(readonlyIndex);
+    ri.sections[2].header.Characteristics &= ~IMAGE_SCN_MEM_WRITE;
+    ri.save(readonlyIndex);
+    rejectsLayout(tlsSource, readonlyIndex, "TLS index must remain writable");
+    auto invalidCallback = tlsSource;
+    store<Address>(invalidCallback, 0x1580, Address(tlsPE.nt.OptionalHeader.ImageBase + 0x2000));
+    rejectsLayout(invalidCallback, reference, "TLS callbacks must remain executable");
+    writeFileAtomic(target, tlsSource);
+    writeFileAtomic(ref, reference);
+    test::require(Patcher(target, {}).createData(ref), "valid TLS layout accepted");
+    test::require(mappedPayload(readFile(target)) == mappedPayload(tlsSource),
+                  "TLS directory, callbacks and index bytes preserved");
+    auto debugSource = source;
+    PEImage debugPE(debugSource);
+    debugPE.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG] = {0x2100,
+                                                                            sizeof(IMAGE_DEBUG_DIRECTORY)};
+    IMAGE_DEBUG_DIRECTORY debug{};
+    debug.Type = IMAGE_DEBUG_TYPE_CODEVIEW;
+    debug.SizeOfData = 0x100;
+    debug.PointerToRawData = 0x2580;
+    debug.AddressOfRawData = 0x3180;
+    store(debugSource, 0x1500, debug);
+    debugSource[0x2580] = 0x52;
+    debugPE.save(debugSource);
+    writeFileAtomic(target, debugSource);
+    Patcher(target, {}).createData(ref);
+    Patcher(target, {}).shrink();
+    auto debugFile = readFile(target);
+    PEImage debugOut(debugFile);
+    auto relocated = load<IMAGE_DEBUG_DIRECTORY>(debugFile, debugOut.fileOffset(0x2100, sizeof(debug)));
+    test::require(relocated.PointerToRawData == debugOut.fileOffset(0x3180, 0x100),
+                  "debug file pointer relocated after compaction");
+    test::require(std::equal(debugSource.begin() + 0x2580, debugSource.begin() + 0x2680,
+                             debugFile.begin() + relocated.PointerToRawData),
+                  "debug zero tail retained at declared size");
+    debug.PointerToRawData = 0x4600;
+    debug.SizeOfData = 4;
+    debug.AddressOfRawData = 0;
+    store(debugSource, 0x1500, debug);
+    writeFileAtomic(target, debugSource);
+    Patcher(target, {}).shrink();
+    debugFile = readFile(target);
+    PEImage overlayPE(debugFile);
+    relocated = load<IMAGE_DEBUG_DIRECTORY>(debugFile, overlayPE.fileOffset(0x2100, sizeof(debug)));
+    test::require(relocated.PointerToRawData == debugFile.size() - 4, "debug overlay file pointer relocated");
+    auto gap = source;
+    gap.insert(gap.begin() + 0x4400, 0x400, 0);
+    gap[0x4500] = 0x55;
+    PEImage gapPE(gap);
+    gapPE.sections[1].header.PointerToRawData = 0x4800;
+    gapPE.save(gap);
+    writeFileAtomic(target, gap);
+    test::rejects([&] { Patcher(target, {}).shrink(); }, "compaction refuses nonzero unclassified raw gaps");
+    test::require(readFile(target) == gap, "failed compaction leaves original file intact");
+}
+void processCopyTests() {
+    TemporaryFolder folder;
+    auto input = folder.path / L"copy.dll";
+    auto original = readFile(executablePath());
+    writeFileAtomic(input, original);
+    Patcher(input, {}).dumpProcess(GetCurrentProcessId());
+    auto output = folder.path / L"copy.novm.dll";
+    auto copied = readFile(output);
+    PEImage pe(copied);
+    auto base = reinterpret_cast<Address>(GetModuleHandleW(nullptr));
+    for (const auto &s : pe.sections)
+        if ((s.header.Characteristics & IMAGE_SCN_MEM_EXECUTE) && s.header.SizeOfRawData) {
+            auto bytes =
+                readMemory(GetCurrentProcess(), base + s.header.VirtualAddress, s.header.SizeOfRawData);
+            test::require(std::equal(bytes.begin(), bytes.end(), copied.begin() + s.header.PointerToRawData),
+                          "process copy uses actual module base and executable section ranges");
+        }
+    test::require(readFile(input) == original, "process copy preserves selected file and extension");
+    PEImage mismatch(original);
+    ++mismatch.nt.FileHeader.TimeDateStamp;
+    mismatch.save(original);
+    writeFileAtomic(input, original);
+    test::rejects([&] { Patcher(input, {}).dumpProcess(GetCurrentProcessId()); },
+                  "process/file timestamp mismatch rejected");
+    test::require(readFile(output) == copied, "failed process copy does not replace earlier output");
 }
 void temporaryDllTests() {
     TemporaryFolder folder;
@@ -575,6 +816,8 @@ int main() {
         trimTests();
         disassemblyTests();
         fileTests();
+        patcherTests();
+        processCopyTests();
         temporaryDllTests();
         memoryTests();
         importDumpTests();
