@@ -87,6 +87,8 @@ void DebuggerCore::created(const DEBUG_EVENT &e) {
     if (!query || query(process_.get(), 0, &pbi, sizeof(pbi), nullptr) < 0)
         throw std::runtime_error("Cannot read PEB");
     auto peb = reinterpret_cast<Address>(pbi.PebBaseAddress);
+    info(L"Debug session: PID " + std::to_wstring(pid_) + L"; PEB 0x" + hex(peb) + L"; image base 0x" +
+         hex(imageBase_));
     write<std::uint8_t>(peb + 2, 0);
 #ifdef _WIN64
     constexpr Address shim = 0x2d8;
@@ -236,10 +238,7 @@ void DebuggerCore::stopTarget() noexcept {
     active_ = false;
 }
 void DebuggerCore::protect(Address a, std::size_t n, DWORD p) {
-    if (!n)
-        throw std::runtime_error("Empty protection range");
-    DWORD old{};
-    check(VirtualProtectEx(process_.get(), reinterpret_cast<void *>(a), n, p, &old), "VirtualProtectEx");
+    protectMemory(process_.get(), a, n, p);
 }
 void DebuggerCore::apply(CONTEXT &c) {
     c.Dr0 = hardware_[0].address;

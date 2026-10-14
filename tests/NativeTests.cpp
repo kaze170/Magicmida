@@ -255,6 +255,38 @@ void memoryTests() {
         auto image = Dumper::imageMemory(GetCurrentProcess(), base, 0x3000);
         test::require(image[0] == 0x33 && image[0x2000] == 0xa5 && image[0x1000] == 0,
                       "region dump handles reserved holes");
+        writeValue<BYTE>(GetCurrentProcess(), base + 0x2000, 0xa6);
+        VirtualQuery(reinterpret_cast<void *>(base + 0x2000), &mbi, sizeof(mbi));
+        test::require(mbi.Protect == PAGE_READWRITE, "writable data remains non-executable");
+        test::rejects([&] { protectMemory(GetCurrentProcess(), base, 0x3000, PAGE_NOACCESS); },
+                      "guard rejects an uncommitted gap");
+        VirtualQuery(reserve, &mbi, sizeof(mbi));
+        test::require(mbi.Protect == PAGE_READONLY, "failed guard preflight preserves first page");
+        Bytes invalidWrite(0x2000, 0x44);
+        test::rejects(
+            [&] { writeMemory(GetCurrentProcess(), base, invalidWrite.data(), invalidWrite.size()); },
+            "write rejects an uncommitted gap");
+        test::require(*static_cast<BYTE *>(reserve) == 0x33, "failed write preflight preserves data");
+        if (!VirtualAlloc(reinterpret_cast<void *>(base + 0x1000), 0x1000, MEM_COMMIT, PAGE_READWRITE))
+            winError("VirtualAlloc(test middle)");
+        const std::array<BYTE, 2> crossing{0xcc, 0xdd};
+        writeMemory(GetCurrentProcess(), base + 0xfff, crossing.data(), crossing.size());
+        VirtualQuery(reserve, &mbi, sizeof(mbi));
+        test::require(mbi.Protect == PAGE_READONLY, "cross-page write restores readonly region");
+        VirtualQuery(reinterpret_cast<void *>(base + 0x1000), &mbi, sizeof(mbi));
+        test::require(mbi.Protect == PAGE_READWRITE, "cross-page write preserves writable region");
+        test::require(*reinterpret_cast<BYTE *>(base + 0xfff) == 0xcc &&
+                          *reinterpret_cast<BYTE *>(base + 0x1000) == 0xdd,
+                      "cross-page write content");
+        protectMemory(GetCurrentProcess(), base, 0x3000, PAGE_NOACCESS);
+        VirtualQuery(reserve, &mbi, sizeof(mbi));
+        test::require(mbi.Protect == PAGE_NOACCESS, "guard applies across protection regions");
+        protectMemory(GetCurrentProcess(), base, 0x3000, PAGE_READWRITE);
+        test::rejects([&] { protectMemory(GetCurrentProcess(), base, 0, PAGE_READONLY); },
+                      "empty guard range rejected");
+        test::rejects(
+            [&] { writeMemory(GetCurrentProcess(), UINTPTR_MAX, crossing.data(), crossing.size()); },
+            "overflowing write range rejected");
     } catch (...) {
         VirtualFree(reserve, 0, MEM_RELEASE);
         throw;

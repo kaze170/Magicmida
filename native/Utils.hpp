@@ -80,7 +80,10 @@ Path unpackedPath(const Path &path);
 DWORD windowsBuild();
 bool readMemory(HANDLE process, Address address, void *buffer, std::size_t size);
 Bytes readMemory(HANDLE process, Address address, std::size_t size);
+// Writes preserve existing page permissions. Writable PEB/TEB/data pages are
+// never unnecessarily converted to executable pages.
 void writeMemory(HANDLE process, Address address, const void *buffer, std::size_t size);
+void protectMemory(HANDLE process, Address address, std::size_t size, DWORD protection);
 template <class T> T readValue(HANDLE process, Address address) {
     T v{};
     if (!readMemory(process, address, &v, sizeof(v)))

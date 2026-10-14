@@ -127,20 +127,133 @@ Bytes readMemory(HANDLE p, Address a, std::size_t n) {
         winError("ReadProcessMemory");
     return b;
 }
-void writeMemory(HANDLE p, Address a, const void *b, std::size_t n) {
-    if (!n)
+namespace {
+struct MemorySpan {
+    Address address{};
+    std::size_t size{};
+    MEMORY_BASIC_INFORMATION region{};
+    DWORD original{};
+    bool changed{};
+};
+std::string memoryDiagnostic(const char *operation, const MemorySpan &span, DWORD requested, DWORD error) {
+    return std::string(operation) + " (Windows error " + std::to_string(error) + "; address=0x" +
+           narrow(hex(span.address)) + "; size=0x" + narrow(hex(span.size)) + "; requested=0x" +
+           narrow(hex(requested)) + "; current=0x" + narrow(hex(span.region.Protect)) + "; state=0x" +
+           narrow(hex(span.region.State)) + "; type=0x" + narrow(hex(span.region.Type)) + "; allocation=0x" +
+           narrow(hex(reinterpret_cast<Address>(span.region.AllocationBase))) + ")";
+}
+std::vector<MemorySpan> memorySpans(HANDLE process, Address address, std::size_t size) {
+    if (size && size - 1 > UINTPTR_MAX - address)
+        throw std::runtime_error("Memory range overflow: address=0x" + narrow(hex(address)) + " size=0x" +
+                                 narrow(hex(size)));
+    std::vector<MemorySpan> result;
+    while (size) {
+        MemorySpan span;
+        span.address = address;
+        span.size = size;
+        if (!VirtualQueryEx(process, reinterpret_cast<const void *>(address), &span.region,
+                            sizeof(span.region)))
+            throw std::runtime_error(memoryDiagnostic("VirtualQueryEx", span, 0, GetLastError()));
+        auto start = reinterpret_cast<Address>(span.region.BaseAddress);
+        if (span.region.State != MEM_COMMIT || address < start || address - start >= span.region.RegionSize)
+            throw std::runtime_error(
+                memoryDiagnostic("Memory range is not committed", span, 0, ERROR_INVALID_ADDRESS));
+        span.size = std::min(size, span.region.RegionSize - (address - start));
+        result.push_back(span);
+        size -= span.size;
+        if (size)
+            address += span.size;
+    }
+    return result;
+}
+void changeProtection(HANDLE process, MemorySpan &span, DWORD protection, const char *operation) {
+    if (span.region.Protect == protection)
         return;
-    DWORD old{};
-    check(VirtualProtectEx(p, reinterpret_cast<void *>(a), n, PAGE_EXECUTE_READWRITE, &old),
-          "VirtualProtectEx");
-    SIZE_T done{};
-    BOOL ok = WriteProcessMemory(p, reinterpret_cast<void *>(a), b, n, &done);
-    DWORD error = GetLastError(), ignored{};
-    BOOL restored = VirtualProtectEx(p, reinterpret_cast<void *>(a), n, old, &ignored);
-    if (!ok || done != n)
-        winError("WriteProcessMemory", error);
-    check(restored, "VirtualProtectEx(restore)");
-    check(FlushInstructionCache(p, reinterpret_cast<void *>(a), n), "FlushInstructionCache");
+    if (!VirtualProtectEx(process, reinterpret_cast<void *>(span.address), span.size, protection,
+                          &span.original))
+        throw std::runtime_error(memoryDiagnostic(operation, span, protection, GetLastError()));
+    span.changed = true;
+}
+// Attempt every restoration even if one fails; report the first failure only
+// after the remaining pages have been put back.
+std::string restoreProtections(HANDLE process, std::vector<MemorySpan> &spans) {
+    std::optional<std::size_t> failed;
+    DWORD error{};
+    for (std::size_t i = spans.size(); i > 0; --i) {
+        auto &span = spans[i - 1];
+        if (!span.changed)
+            continue;
+        DWORD ignored{};
+        if (!VirtualProtectEx(process, reinterpret_cast<void *>(span.address), span.size, span.original,
+                              &ignored) &&
+            !failed) {
+            error = GetLastError();
+            failed = i - 1;
+        }
+        span.changed = false;
+    }
+    return failed
+               ? memoryDiagnostic("VirtualProtectEx(restore)", spans[*failed], spans[*failed].original, error)
+               : std::string{};
+}
+} // namespace
+void protectMemory(HANDLE process, Address address, std::size_t size, DWORD protection) {
+    if (!size)
+        throw std::runtime_error("Empty guard protection range at 0x" + narrow(hex(address)));
+    // Preflight the complete range first. A single VirtualProtectEx spanning
+    // separate reservations or an uncommitted gap is invalid on Windows.
+    auto spans = memorySpans(process, address, size);
+    try {
+        for (auto &span : spans)
+            changeProtection(process, span, protection, "VirtualProtectEx(guard)");
+    } catch (const std::exception &error) {
+        auto restoreError = restoreProtections(process, spans);
+        if (!restoreError.empty())
+            throw std::runtime_error(std::string(error.what()) + "; " + restoreError);
+        throw;
+    }
+}
+void writeMemory(HANDLE process, Address address, const void *buffer, std::size_t size) {
+    if (!size)
+        return;
+    auto spans = memorySpans(process, address, size);
+    try {
+        for (auto &span : spans) {
+            auto basic = span.region.Protect & 0xff;
+            bool writable = basic == PAGE_READWRITE || basic == PAGE_WRITECOPY ||
+                            basic == PAGE_EXECUTE_READWRITE || basic == PAGE_EXECUTE_WRITECOPY;
+            // PEB/TEB pages can reject protection changes (ERROR_INVALID_PARAMETER)
+            // even though WriteProcessMemory is permitted. Do not touch their
+            // protection when the existing mapping is already writable.
+            if (writable && !(span.region.Protect & PAGE_GUARD))
+                continue;
+            bool executable = basic == PAGE_EXECUTE || basic == PAGE_EXECUTE_READ ||
+                              basic == PAGE_EXECUTE_READWRITE || basic == PAGE_EXECUTE_WRITECOPY;
+            DWORD desired = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
+            desired |= span.region.Protect & (PAGE_NOCACHE | PAGE_WRITECOMBINE);
+            changeProtection(process, span, desired, "VirtualProtectEx(write)");
+        }
+        SIZE_T done{};
+        BOOL ok = WriteProcessMemory(process, reinterpret_cast<void *>(address), buffer, size, &done);
+        DWORD error = ok ? ERROR_PARTIAL_COPY : GetLastError();
+        if (!ok || done != size) {
+            MemorySpan whole = spans.front();
+            whole.address = address;
+            whole.size = size;
+            throw std::runtime_error(memoryDiagnostic("WriteProcessMemory", whole, 0, error) +
+                                     "; written=" + std::to_string(done));
+        }
+    } catch (const std::exception &error) {
+        auto restoreError = restoreProtections(process, spans);
+        if (!restoreError.empty())
+            throw std::runtime_error(std::string(error.what()) + "; " + restoreError);
+        throw;
+    }
+    auto restoreError = restoreProtections(process, spans);
+    if (!restoreError.empty())
+        throw std::runtime_error(restoreError);
+    check(FlushInstructionCache(process, reinterpret_cast<const void *>(address), size),
+          "FlushInstructionCache");
 }
 CONTEXT context(HANDLE t, DWORD flags) {
     CONTEXT c{};
