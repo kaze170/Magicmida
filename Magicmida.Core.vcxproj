@@ -30,6 +30,7 @@
     <ClInclude Include="native\Binary.hpp" />
     <ClInclude Include="native\DebuggerCore.hpp" />
     <ClInclude Include="native\Dumper.hpp" />
+    <ClInclude Include="native\ImportPlan.hpp" />
     <ClInclude Include="native\OneCoreUAP.hpp" />
     <ClInclude Include="native\PEInfo.hpp" />
     <ClInclude Include="native\Patcher.hpp" />

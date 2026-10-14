@@ -9,10 +9,11 @@ Win32 GUI, command-line entry point and unpacking core are in `native/`;
 **Delphi, Lazarus and their prebuilt `.obj` files are not required** by this solution.
 The Pascal sources remain unchanged as a reference and legacy build path.
 
-> Validation status: both architectures have been cross-compiled and linked in
-> the Linux development environment, and portable tests have run. The MSVC v145
-> build, Windows integration tests and real Themida target regressions still need
-> to run on Windows. This is not yet a claim of verified runtime parity.
+> Validation status: all four configurations have built with real VS2026 / MSVC
+> v145 on Windows CI, in addition to local cross-builds and portable tests.
+> Windows debugger integration tests still have a tracked failure; sparse IAT
+> reconstruction now has additional regression coverage pending Windows CI.
+> Real protected-target parity is not yet established; see the migration notes.
 
 See [繁體中文移植與驗證說明](docs/VC2026-migration.md) for module coverage,
 intentional differences, verification steps and remaining runtime checks.

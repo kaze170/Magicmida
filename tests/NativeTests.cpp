@@ -296,6 +296,18 @@ void memoryTests() {
 void importDumpTests() {
     TemporaryFolder folder;
     auto original = fixture();
+    // Also make this fixture loadable: the final check asks the real Windows
+    // loader to bind sparse imports, not just our own PE parser to accept them.
+    PEImage originalPE(original);
+    originalPE.nt.FileHeader.Characteristics = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE;
+    originalPE.nt.OptionalHeader.MajorOperatingSystemVersion = 6;
+    originalPE.nt.OptionalHeader.MajorSubsystemVersion = 6;
+    originalPE.nt.OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    originalPE.nt.OptionalHeader.SizeOfStackReserve = 0x100000;
+    originalPE.nt.OptionalHeader.SizeOfStackCommit = 0x1000;
+    originalPE.nt.OptionalHeader.SizeOfHeapReserve = 0x100000;
+    originalPE.nt.OptionalHeader.SizeOfHeapCommit = 0x1000;
+    originalPE.save(original);
     auto originalPath = folder.path / L"original.exe";
     writeFileAtomic(originalPath, original);
     void *allocation = VirtualAlloc(nullptr, 0x3000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -346,6 +358,80 @@ void importDumpTests() {
             test::require(std::uint64_t(section.header.PointerToRawData) + section.header.SizeOfRawData <=
                               file.size(),
                           "dump raw section within file");
+        auto ntClose = reinterpret_cast<Address>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtClose"));
+        test::require(ntClose && d.isAPI(ntClose), "second module fixture export resolves");
+        const std::array<Address, 10> sparse{addresses[0], 0,          0x11223344, 0x55667788,   0,
+                                             addresses[1], 0x44556677, ntClose,    addresses[0], 0x12345678};
+        std::memcpy(reinterpret_cast<void *>(base + 0x2000), sparse.data(), sizeof(sparse));
+        test::require(d.iatSize(sparse) == 9, "IAT bound excludes nonzero trailing metadata");
+        auto sparseOutput = folder.path / L"sparse.dll";
+        Dumper sparseDumper(GetCurrentProcess(), GetCurrentProcessId(), originalPath, base, base, {});
+        sparseDumper.dump(sparseOutput, base + 0x2000, true); // entry RVA 0: no code to execute
+        auto sparseFile = readFile(sparseOutput);
+        PEImage sparsePE(sparseFile);
+        auto sparseDir = sparsePE.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        test::require(sparseDir.Size == 5 * sizeof(IMAGE_IMPORT_DESCRIPTOR),
+                      "four sparse descriptors plus null descriptor");
+        const std::array<std::size_t, 4> starts{0, 5, 7, 8};
+        for (auto slot : starts) {
+            auto i = std::size_t(std::find(starts.begin(), starts.end(), slot) - starts.begin());
+            auto desc = load<IMAGE_IMPORT_DESCRIPTOR>(
+                sparseFile,
+                sparsePE.fileOffset(sparseDir.VirtualAddress + i * sizeof(IMAGE_IMPORT_DESCRIPTOR),
+                                    sizeof(IMAGE_IMPORT_DESCRIPTOR)));
+            test::require(desc.FirstThunk == 0x2000 + slot * sizeof(Address),
+                          "sparse FirstThunk has original index");
+            auto lookup =
+                load<Address>(sparseFile, sparsePE.fileOffset(desc.OriginalFirstThunk, sizeof(Address)));
+            test::require(lookup != 0 &&
+                              lookup == load<Address>(sparseFile,
+                                                      sparsePE.fileOffset(desc.FirstThunk, sizeof(Address))),
+                          "sparse lookup matches IAT");
+            test::require(
+                load<Address>(sparseFile, sparsePE.fileOffset(desc.OriginalFirstThunk + sizeof(Address),
+                                                              sizeof(Address))) == 0,
+                "each sparse lookup independently terminated");
+            if (slot == 7)
+                test::require(stringAt(sparseFile, sparsePE.fileOffset(desc.Name)) == "ntdll.dll",
+                              "mixed module gets its own descriptor");
+        }
+        auto terminator = load<IMAGE_IMPORT_DESCRIPTOR>(
+            sparseFile, sparsePE.fileOffset(sparseDir.VirtualAddress + 4 * sizeof(IMAGE_IMPORT_DESCRIPTOR),
+                                            sizeof(IMAGE_IMPORT_DESCRIPTOR)));
+        test::require(terminator.FirstThunk == 0 && terminator.OriginalFirstThunk == 0 &&
+                          terminator.Name == 0,
+                      "descriptor array terminated");
+        for (auto slot : std::array<std::size_t, 6>{1, 2, 3, 4, 6, 9})
+            test::require(load<Address>(sparseFile, sparsePE.fileOffset(0x2000 + slot * sizeof(Address),
+                                                                        sizeof(Address))) == sparse[slot],
+                          "unknown data, zeros and trailing metadata preserved on disk");
+        test::require(sparsePE.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size ==
+                          9 * sizeof(Address),
+                      "IAT directory does not claim overwritten extra terminator");
+        // Release its preferred image base before asking the loader to map the
+        // dump. It deliberately has no relocations and no DllMain entry point.
+        check(VirtualFree(allocation, 0, MEM_RELEASE), "VirtualFree(import fixture)");
+        allocation = nullptr;
+        HMODULE loaded = LoadLibraryW(sparseOutput.c_str());
+        if (!loaded)
+            winError("LoadLibrary(sparse import dump)");
+        try {
+            auto loadedBase = reinterpret_cast<Address>(loaded);
+            for (auto slot : starts)
+                test::require(
+                    readValue<Address>(GetCurrentProcess(), loadedBase + 0x2000 + slot * sizeof(Address)) ==
+                        sparse[slot],
+                    "Windows loader binds each sparse API to the correct original slot");
+            for (auto slot : std::array<std::size_t, 6>{1, 2, 3, 4, 6, 9})
+                test::require(
+                    readValue<Address>(GetCurrentProcess(), loadedBase + 0x2000 + slot * sizeof(Address)) ==
+                        sparse[slot],
+                    "Windows loader does not overwrite adjacent metadata");
+        } catch (...) {
+            FreeLibrary(loaded);
+            throw;
+        }
+        check(FreeLibrary(loaded), "FreeLibrary(sparse import dump)");
     } catch (...) {
         VirtualFree(allocation, 0, MEM_RELEASE);
         throw;
@@ -371,22 +457,32 @@ class DebugProbe final : public DebuggerCore {
         hardware_ = imageBase_ + reinterpret_cast<Address>(&fixtureHardware) - local;
         setSoftBP(soft_);
         setBreakpoint(hardware_);
+        auto c = context(thread());
+        info(L"Probe armed: soft=0x" + hex(soft_) + L" hard=0x" + hex(hardware_) + L" DR0=0x" + hex(c.Dr0) +
+             L" DR7=0x" + hex(c.Dr7));
+        test::require(read<BYTE>(soft_) == 0xcc, "software breakpoint byte installed");
+        test::require(c.Dr0 == hardware_ && (c.Dr7 & 1), "hardware breakpoint registers installed");
     }
     SoftAction onSoftware(HANDLE, Address a) override {
         test::require(a == soft_, "software breakpoint address");
         softHit = true;
         auto before = context(thread());
+        info(L"Probe software hit; DR6=0x" + hex(before.Dr6) + L" DR7=0x" + hex(before.Dr7));
         auto local = reinterpret_cast<Address>(GetModuleHandleW(nullptr));
         auto start = imageBase_ + reinterpret_cast<Address>(&fixtureTrace) - local;
         test::require(trace(start, 16, [](unsigned count, CONTEXT &) { return count >= 1; }),
                       "single-step trace completes");
         auto after = context(thread());
+        info(L"Probe trace restored; DR6=0x" + hex(after.Dr6) + L" DR7=0x" + hex(after.Dr7));
+        test::require(before.Dr0 == after.Dr0 && before.Dr7 == after.Dr7,
+                      "trace restores hardware breakpoints");
         test::require(ip(before) == ip(after) && sp(before) == sp(after), "trace restores control context");
         return SoftAction::Clear;
     }
     void onHardware(HANDLE, Address a, CONTEXT &) override {
         test::require(a == hardware_, "hardware breakpoint address");
         hardHit = true;
+        info(L"Probe hardware hit.");
         resetBreakpoint(a);
         finished_ = true;
     }
@@ -403,8 +499,9 @@ void debuggerTests() {
         DebugProbe p(executablePath(), logger, cancel);
         bool result = p.run();
         test::require(p.started, "loader breakpoint must initialize debugger");
+        test::require(p.softHit, "software callback observed");
+        test::require(p.hardHit, "hardware callback observed");
         test::require(result, "debug event loop finishes");
-        test::require(p.softHit && p.hardHit, "software and hardware callbacks observed");
         cancel = true;
         DebugProbe cancelled(executablePath(), logger, cancel);
         test::require(!cancelled.run(), "cancellation reports failure");
@@ -417,6 +514,9 @@ void debuggerTests() {
 } // namespace
 int main() {
     if (GetEnvironmentVariableW(L"MAGICMIDA_TEST_CHILD", nullptr, 0)) {
+        auto sites = L"Probe child sites: soft=0x" + hex(reinterpret_cast<Address>(&fixtureSoft)) +
+                     L" hard=0x" + hex(reinterpret_cast<Address>(&fixtureHardware));
+        OutputDebugStringW(sites.c_str());
         fixtureSoft();
         fixtureHardware();
         return fixtureCounter == 3 ? 0 : 3;

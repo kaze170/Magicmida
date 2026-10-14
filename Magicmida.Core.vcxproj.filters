@@ -16,6 +16,7 @@
     <ClInclude Include="native\Binary.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\DebuggerCore.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\Dumper.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\ImportPlan.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\OneCoreUAP.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\PEInfo.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\Patcher.hpp"><Filter>Header Files</Filter></ClInclude>

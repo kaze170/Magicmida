@@ -12,7 +12,7 @@
 - `/std:c++latest` 表示使用所安裝 MSVC 提供的 C++26 預覽能力，**不保證所有 C++26 特性均已實作**。
 - 原生執行環境為 Windows 10／11；不宣稱保留舊 Pascal 工具鏈的 Windows XP 相容性。
 
-**原始碼移植與交叉建置已完成，但 Windows／MSVC 實測尚未完成。**
+**四組態真正 VS2026／MSVC 建置已通過；Windows 除錯器整合測試仍在排查，授權目標完整回歸尚未完成。**
 在 Windows 建置矩陣與授權目標回歸測試通過前，不能將這份移植視為已證實與 Pascal 版完全等效。
 
 ## 模組對照
@@ -47,13 +47,20 @@
 7. API 位址由目標已載入的模組 base 加上 export RVA 算出，不假設本程序與目標的 ASLR base 相同。
 8. Trace 結束後還原 context、成對 ResumeThread；不將 trace 的最後一個事件重複 Continue。
 9. IAT 範圍受 SizeOfImage 限制，避免小型目標被固定 5,120-entry 讀取越界；建立獨立、以零結尾的 lookup table。
-10. 無法解析的 IAT 不再假裝成功輸出；回報失敗，避免產生已知不完整的 import table。
+10. IAT 推估範圍可能混有非匯入資料：保留未分類 word 並記錄位址／數量，不將它們清零或偽造為 import；遇到空隙或不同 DLL 時建立獨立 descriptor／零結尾 OFT，保持原始 FirstThunk 位置。尾端只納入原有的零值，不強制覆寫下一個 word。完全沒有可解析 API 仍回報失敗。保留的資料可能是真正未解析的 import，必須以實際目標驗證，不保證輸出可執行。
 11. PE 儲存只清理移除的 section headers，不任意覆寫後方 0x200 bytes；resource directory 可以不在 section 起點。
 12. 檔案輸出先寫同目錄暫存檔，再 replace；失敗時保留原檔。臨時 DLL executable 只有建立成功才由此工具負責刪除。
 13. x86 dump-process 以實際模組 base 讀取 `.text`；處理 ASLR，不使用磁碟上的 preferred ImageBase。
 14. CLI 保留 `/unpack`，新增 `/help`、`--no-data`；成功／失敗／參數錯誤分別回傳 0／1／2。
 
 這些差異本身需要 Windows 回歸測試，不能只靠編譯判定行為正確。
+
+## Windows 執行修正追蹤
+
+- `VirtualProtectEx` error 87：對本來就可寫的資料頁不再強制改成可執行頁；跨區域写入逐區驗證、調整並還原原保護屬性。
+- Loader 初始化：保留 CREATE_PROCESS 階段的 `PEB.BeingDebugged`，等 loader breakpoint 到達才清除，避免初始中斷點被 Windows 省略而未呼叫解包初始化。
+- x64 `Unresolved IAT group`：不再假設推估 IAT 內每個非零連續區塊都是單一 DLL 的完整匯入；以保留資料與分段 OFT 重建處理，附回歸測試與診斷。
+- 使用者回報 x86 看似正常，x64 已到 TLS／OEP 還原與大量 API trace；這是該目標的階段性證據，尚不是全部目標的執行等效證明。
 
 ## 建置與執行
 
@@ -80,7 +87,7 @@ PowerShell 7：
 - 原生 manifest 在 `native/Magicmida.manifest`，與 Pascal 版的根目錄 manifest 分開。
 - Debug build 需要開發環境的 debug CRT；部署 Release build 時需有對應架構的 Visual C++ runtime。
 
-## 驗證紀錄（2026-10-14）
+## 驗證紀錄（2026-10-15）
 
 | 驗證 | 狀態 |
 | --- | --- |
@@ -88,10 +95,10 @@ PowerShell 7：
 | BeaEngine C 原始碼 Win32／x64 編譯 | 已通過；第三方程式保留其既有警告 |
 | Win32／x64 應用與測試 EXE 完整連結 | 已通過交叉連結；EXE 沒有在 Linux 執行 |
 | RC icons／version／manifest 資源 | 已通過交叉資源編譯與連結 |
-| Portable unit tests | 已執行，1,034 項檢查通過；另以 AddressSanitizer／UBSan 執行通過 |
+| Portable unit tests | 已執行，新增稀疏／混合 DLL／未知資料 IAT 與隨機覆蓋檢查，通過；另以 AddressSanitizer／UBSan 執行通過 |
 | `.slnx`／`.vcxproj` XML、來源／filters、3,003 筆 mapping、legacy patterns | `tools/validate_native.py` 提供離線一致性檢查 |
-| 真正 VS2026／v145 Debug／Release × Win32／x64 | **待 Windows 執行**；已加入 CI 矩陣，不宣稱已跑完 |
-| Windows native unit／integration／CLI tests | **待 Windows 執行**；不是已通過的測試 |
+| 真正 VS2026／v145 Debug／Release × Win32／x64 | **四組態已通過真正 MSVC 建置**；最新修改仍需對應 CI 驗證 |
+| Windows native unit／integration／CLI tests | 已執行；前次 CI 的除錯器 callback 測試未通過，正補診斷；新增稀疏 IAT 的真正 Windows loader 綁定測試待本次 CI |
 | 真實 Themida、ScyllaHide、TLS／OEP、.NET、DLL 目標 | **待授權樣本回歸測試** |
 
 Portable 檢查可在 Linux 執行：

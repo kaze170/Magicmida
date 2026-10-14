@@ -2,6 +2,7 @@
 #include "Test.hpp"
 #include "Binary.hpp"
 #include "OneCoreUAP.hpp"
+#include "ImportPlan.hpp"
 #include <array>
 #include <random>
 using namespace mm;
@@ -48,6 +49,95 @@ void portableTests() {
     require(oneCoreModule("SHCreateDirectoryExW") == "api-ms-win-shell-shdirectory-l1-1-0.dll",
             "last OneCore API");
     require(oneCoreModule("__not_an_api__").empty(), "unknown OneCore API");
+    {
+        constexpr std::uint64_t a = 0x7fff0737b090ULL, b = 0x7fff07377300ULL, c = 0x7fff0969a1f0ULL;
+        ImportCandidates candidates{{a, {{"kernelbase.dll", "Alpha"}, {"kernel32.dll", "Alpha"}}},
+                                    {b, {{"kernelbase.dll", "Beta"}, {"kernel32.dll", "Beta"}}},
+                                    {c, {{"user32.dll", "Gamma"}}}};
+        const std::vector<std::uint64_t> normal{a, b, 0};
+        auto plan = planImports(normal, candidates, {});
+        require(plan.runs.size() == 1 && plan.runs[0].dll == "kernel32.dll" && plan.runs[0].names.size() == 2,
+                "module vote prefers kernel32 over kernelbase");
+        const std::vector<std::uint64_t> gaps{a, 0, 0x11223344, 0x55667788, 0, b, 0x44556677, a, 0};
+        plan = planImports(gaps, candidates, {});
+        require(plan.runs.size() == 3, "metadata groups and interior holes do not abort IAT planning");
+        require(plan.runs[0].first == 0 && plan.runs[1].first == 5 && plan.runs[2].first == 7,
+                "holes retain exact FirstThunk indices");
+        require(plan.unclassified.size() == 2 && plan.unclassified[0].first == 2 &&
+                    plan.unclassified[0].count == 2 && plan.unclassified[1].first == 6,
+                "unknown data ranges retained");
+        const std::vector<std::uint64_t> mixed{a, c, b, 0};
+        plan = planImports(mixed, candidates, {});
+        require(plan.runs.size() == 3 && plan.runs[1].dll == "user32.dll" && plan.runs[1].first == 1,
+                "mixed modules split without dropping real APIs");
+        const std::vector<std::uint64_t> unknown{0x11223344, 0, 0x55667788};
+        rejects([&] { planImports(unknown, candidates, {}); }, "all-unresolved table must still fail");
+        const std::vector<std::uint64_t> zero{0, 0};
+        rejects([&] { planImports(zero, candidates, {}); }, "all-zero table must still fail");
+        const std::vector<std::uint64_t> leading{0x778899, 0, a, 0};
+        plan = planImports(leading, candidates, {});
+        require(plan.runs[0].first == 2 && plan.unclassified[0].first == 0,
+                "leading metadata does not shift first import");
+        auto aliases = candidates;
+        aliases[a].insert(aliases[a].end(), 20, ImportSymbol{"kernelbase.dll", "Alias"});
+        require(planImports(normal, aliases, {}).runs[0].dll == "kernel32.dll",
+                "duplicate aliases cannot inflate votes");
+        std::reverse(aliases[a].begin(), aliases[a].end());
+        require(planImports(normal, aliases, {}).runs[0].dll == "kernel32.dll",
+                "module choice independent of candidate order");
+        ImportCandidates contracts{{a, {{"ntdll.dll", "RtlQueryPerformanceCounter"}}},
+                                   {b, {{"kernelbase.dll", "QueryPerformanceFrequency"}}}};
+        OriginalImports withApiSet{{"api-ms-win-core-profile-l1-1-0.dll", "QueryPerformanceCounter"}};
+        plan = planImports(normal, contracts, withApiSet);
+        require(plan.runs.size() == 1 && plan.runs[0].dll == "api-ms-win-core-profile-l1-1-0.dll" &&
+                    plan.runs[0].names[0] == "QueryPerformanceCounter",
+                "OneCore contract remaps compatible names");
+        withApiSet.emplace("ntdll.dll", "RtlQueryPerformanceCounter");
+        plan = planImports(normal, contracts, withApiSet);
+        require(plan.runs[0].dll == "ntdll.dll", "explicit original import prevents API-set rewriting");
+        ImportCandidates ordinal{{a, {{"sample.dll", "#42"}}}};
+        plan = planImports(std::span(normal).first(1), ordinal, {});
+        require(plan.runs[0].names[0] == "#42", "ordinal import retained");
+        std::mt19937 planRandom(20261015);
+        for (unsigned iteration = 0; iteration < 100; ++iteration) {
+            const std::uint64_t choices[]{0, a, b, c, 0x9988776655443322ULL};
+            std::vector<std::uint64_t> input(32);
+            for (auto &value : input)
+                value = choices[planRandom() % 5];
+            input[0] = a;
+            auto randomPlan = planImports(input, candidates, {});
+            std::vector<unsigned> covered(input.size());
+            for (const auto &run : randomPlan.runs) {
+                require(!run.names.empty() && run.first + run.names.size() <= input.size(),
+                        "planned run bounded");
+                for (std::size_t j = 0; j < run.names.size(); ++j) {
+                    auto index = run.first + j;
+                    require(candidates.contains(input[index]), "run never crosses an unknown slot");
+                    const auto &symbols = candidates.at(input[index]);
+                    require(std::any_of(symbols.begin(), symbols.end(),
+                                        [&](const auto &symbol) {
+                                            return symbol.dll == run.dll && symbol.name == run.names[j];
+                                        }),
+                            "run only contains matching-module exports");
+                    ++covered[index];
+                }
+            }
+            for (const auto &range : randomPlan.unclassified) {
+                require(range.count > 0 && range.first + range.count <= input.size(),
+                        "unclassified range bounded");
+                for (auto j = range.first; j < range.first + range.count; ++j) {
+                    require(input[j] != 0 && !candidates.contains(input[j]),
+                            "only unknown nonzero data is preserved as unclassified");
+                    ++covered[j];
+                }
+            }
+            for (std::size_t j = 0; j < input.size(); ++j)
+                require(covered[j] == unsigned(input[j] != 0),
+                        "every nonzero slot classified exactly once, zero slots untouched");
+        }
+        candidates[a] = {{"", "Alpha"}};
+        rejects([&] { planImports(normal, candidates, {}); }, "invalid candidate not silently discarded");
+    }
     std::mt19937 random(0x170);
     // Exercise boundary matches and absent patterns against a simple reference.
     for (unsigned round = 0; round < 1000; ++round) {

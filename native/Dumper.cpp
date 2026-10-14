@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "Dumper.hpp"
+#include "ImportPlan.hpp"
 #include <tlhelp32.h>
 namespace mm {
 Bytes Dumper::imageMemory(HANDLE p, Address base, std::size_t size) {
@@ -219,78 +220,39 @@ void Dumper::dump(const Path &output, Address iat, bool dll) {
     auto count = std::min(maxImports, (image.size() - iatRva) / sizeof(Address));
     std::vector<Address> slots(count);
     std::memcpy(slots.data(), image.data() + iatRva, count * sizeof(Address));
-    slots.resize(iatSize(slots));
-    struct Group {
-        std::size_t first;
-        std::string dll;
-        std::vector<std::string> names;
-    };
-    std::vector<Group> groups;
-    bool allowSets = std::any_of(originalImports_.begin(), originalImports_.end(),
-                                 [](auto &p) { return p.first.starts_with("api-ms-win"); });
-    auto score = [](std::string_view name) {
-        constexpr std::string_view preferred[] = {"kernel32.dll", "ole32.dll",    "advapi32.dll",
-                                                  "netapi32.dll", "comdlg32.dll", "crypt32.dll",
-                                                  "gdi32.dll",    "dbghelp.dll",  "setupapi.dll"};
-        return std::find(std::begin(preferred), std::end(preferred), name) != std::end(preferred);
-    };
-    for (std::size_t i = 0; i < slots.size();) {
-        if (!slots[i]) {
-            ++i;
+    auto extent = iatSize(slots);
+    // Include an existing terminator, but never manufacture one by overwriting
+    // a nonzero word just beyond the inferred IAT.
+    if (extent < slots.size() && slots[extent] == 0)
+        ++extent;
+    slots.resize(extent);
+    std::vector<std::uint64_t> addresses(slots.begin(), slots.end());
+    ImportCandidates candidates;
+    for (auto address : slots) {
+        auto found = candidates_.find(address);
+        if (found == candidates_.end() || candidates.contains(address))
             continue;
-        }
-        auto end = i;
-        while (end < slots.size() && slots[end])
-            ++end;
-        std::map<std::size_t, unsigned> votes;
-        for (auto j = i; j < end; ++j)
-            if (auto it = candidates_.find(slots[j]); it != candidates_.end()) {
-                std::set<std::size_t> once;
-                for (auto c : it->second)
-                    if (once.insert(c.module).second)
-                        ++votes[c.module];
-            }
-        if (votes.empty())
-            throw std::runtime_error("Unresolved IAT group");
-        auto winner = votes.begin()->first;
-        for (auto [m, n] : votes)
-            if (n > votes[winner] ||
-                (n == votes[winner] && score(modules_[m].name) > score(modules_[winner].name)))
-                winner = m;
-        Group g{i, modules_[winner].name, {}};
-        std::string apiSet;
-        bool sameSet = true;
-        for (auto j = i; j < end; ++j) {
-            auto it = candidates_.find(slots[j]);
-            if (it == candidates_.end())
-                throw std::runtime_error("Unresolved IAT slot; refusing to emit a broken import table");
-            auto chosen = std::find_if(it->second.begin(), it->second.end(),
-                                       [&](auto c) { return c.module == winner; });
-            auto c = chosen == it->second.end() ? it->second.front() : *chosen;
-            auto name = modules_[c.module].exports[c.entry].name;
-            auto lookup = name.starts_with("RtlQueryPerformance") ? name.substr(3) : name;
-            std::string set(oneCoreModule(lookup));
-            if (j == i)
-                apiSet = set;
-            else if (apiSet != set)
-                sameSet = false;
-            g.names.push_back(name);
-        }
-        if (allowSets && sameSet && !apiSet.empty() && !originalImports_.contains({g.dll, g.names.front()})) {
-            g.dll = apiSet;
-            for (auto &name : g.names)
-                if (name.starts_with("RtlQueryPerformance"))
-                    name.erase(0, 3);
-        } else {
-            for (auto j = i; j < end; ++j) {
-                auto &cs = candidates_.at(slots[j]);
-                if (std::none_of(cs.begin(), cs.end(), [&](auto c) { return c.module == winner; }))
-                    throw std::runtime_error("Import group spans incompatible modules");
-            }
-        }
-        groups.push_back(std::move(g));
-        i = end;
+        auto &out = candidates[address];
+        for (const auto &c : found->second)
+            out.push_back({modules_[c.module].name, modules_[c.module].exports[c.entry].name});
     }
+    auto plan = planImports(addresses, candidates, originalImports_);
+    const auto &groups = plan.runs;
+    std::size_t preserved = 0;
+    for (const auto &range : plan.unclassified) {
+        preserved += range.count;
+        log(log_, LogType::Info,
+            L"IAT: preserving unclassified data at 0x" + hex(iat + range.first * sizeof(Address)) + L" (" +
+                std::to_wstring(range.count) + L" slots; first value 0x" + hex(slots[range.first]) +
+                L"). No import descriptor emitted for these slots.");
+    }
+    log(log_, LogType::Info,
+        L"IAT reconstruction: " + std::to_wstring(groups.size()) + L" contiguous import runs, " +
+            std::to_wstring(preserved) + L" unclassified slots preserved.");
+    if (preserved)
+        log(log_, LogType::Info,
+            L"WARNING: preserved IAT-range data is not verified as imports; validate the resulting dump at "
+            L"runtime.");
     Bytes import((groups.size() + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR));
     auto appendString = [&](std::string_view s) {
         auto off = import.size();
@@ -301,7 +263,7 @@ void Dumper::dump(const Path &output, Address iat, bool dll) {
     pe.trimHugeSections(image);
     auto &sect = pe.append(".import", 0x1000);
     auto start = sect.header.VirtualAddress;
-    std::vector<Address> rebuilt(slots.size() + 1); // Include the final IAT terminator.
+    std::vector<Address> rebuilt = slots; // Preserve unclassified words and original separators.
     for (std::size_t i = 0; i < groups.size(); ++i) {
         auto &g = groups[i];
         IMAGE_IMPORT_DESCRIPTOR d{};
