@@ -11,8 +11,8 @@ The Pascal sources remain unchanged as a reference and legacy build path.
 
 > Validation status: all four configurations have built with real VS2026 / MSVC
 > v145 on Windows CI, in addition to local cross-builds and portable tests.
-> Windows debugger integration tests still have a tracked failure; sparse IAT
-> reconstruction now has additional regression coverage pending Windows CI.
+> Sparse IAT reconstruction has passed actual Windows loader checks in all four
+> configurations. A debugger fixture startup-timing correction awaits CI.
 > Real protected-target parity is not yet established; see the migration notes.
 
 See [繁體中文移植與驗證說明](docs/VC2026-migration.md) for module coverage,

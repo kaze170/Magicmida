@@ -57,7 +57,7 @@
 
 ## Windows 執行修正追蹤
 
-- `VirtualProtectEx` error 87：對本來就可寫的資料頁不再強制改成可執行頁；跨區域写入逐區驗證、調整並還原原保護屬性。
+- `VirtualProtectEx` error 87：對本來就可寫的資料頁不再強制改成可執行頁；跨區域寫入逐區驗證、調整並還原原保護屬性。
 - Loader 初始化：保留 CREATE_PROCESS 階段的 `PEB.BeingDebugged`，等 loader breakpoint 到達才清除，避免初始中斷點被 Windows 省略而未呼叫解包初始化。
 - x64 `Unresolved IAT group`：不再假設推估 IAT 內每個非零連續區塊都是單一 DLL 的完整匯入；以保留資料與分段 OFT 重建處理，附回歸測試與診斷。
 - 使用者回報 x86 看似正常，x64 已到 TLS／OEP 還原與大量 API trace；這是該目標的階段性證據，尚不是全部目標的執行等效證明。
@@ -95,10 +95,10 @@ PowerShell 7：
 | BeaEngine C 原始碼 Win32／x64 編譯 | 已通過；第三方程式保留其既有警告 |
 | Win32／x64 應用與測試 EXE 完整連結 | 已通過交叉連結；EXE 沒有在 Linux 執行 |
 | RC icons／version／manifest 資源 | 已通過交叉資源編譯與連結 |
-| Portable unit tests | 已執行，新增稀疏／混合 DLL／未知資料 IAT 與隨機覆蓋檢查，通過；另以 AddressSanitizer／UBSan 執行通過 |
+| Portable unit tests | 已執行，10,532 項檢查通過（含稀疏／混合 DLL／未知資料 IAT 與隨機覆蓋）；另以 AddressSanitizer／UBSan 執行通過 |
 | `.slnx`／`.vcxproj` XML、來源／filters、3,003 筆 mapping、legacy patterns | `tools/validate_native.py` 提供離線一致性檢查 |
 | 真正 VS2026／v145 Debug／Release × Win32／x64 | **四組態已通過真正 MSVC 建置**；最新修改仍需對應 CI 驗證 |
-| Windows native unit／integration／CLI tests | 已執行；前次 CI 的除錯器 callback 測試未通過，正補診斷；新增稀疏 IAT 的真正 Windows loader 綁定測試待本次 CI |
+| Windows native unit／integration／CLI tests | 稀疏 IAT 的真正 Windows loader 綁定與資料保留已在四組態通過；修正除錯器測試於 loader context 還原前設定 HWBP 的時序假設，待本次 CI |
 | 真實 Themida、ScyllaHide、TLS／OEP、.NET、DLL 目標 | **待授權樣本回歸測試** |
 
 Portable 檢查可在 Linux 執行：
@@ -128,7 +128,8 @@ python3 tools/cross_check.py --zig /path/to/zig
 - BeaEngine ABI 與指令邊界。
 - Unicode 檔案、原子替換失敗保留原檔、暫存檔清理。
 - 記憶體保護還原、reserved memory holes。
-- 用本程序真正 exports 建立合成 IAT，檢查輸出的 descriptors、名稱與 lookup terminator。
+- 用本程序真正 exports 建立合成 IAT，檢查 descriptors、名稱、lookup terminator、未知區塊／洞、混合 DLL、尾端資料、image-end 邊界，以及超過一頁的匯入表。
+- 讓真正 Windows loader 載入稀疏 IAT 的測試 DLL，確認 API 綁定位置及相鄰資料完整性。
 - 以測試程式本身作為子程序，測試軟／硬體中斷點與取消，不需要任何受保護第三方樣本。
 
 ## Windows 手動驗收清單

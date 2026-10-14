@@ -358,6 +358,51 @@ void importDumpTests() {
             test::require(std::uint64_t(section.header.PointerToRawData) + section.header.SizeOfRawData <=
                               file.size(),
                           "dump raw section within file");
+        // Place an import at the final word of the image: a synthesized extra
+        // IAT terminator used to overflow the original image/section here.
+        auto edgeHeader = original;
+        PEImage edgePE(edgeHeader);
+        edgePE.sections.back().header.Misc.VirtualSize = 0x1000;
+        edgePE.save(edgeHeader);
+        std::memcpy(allocation, edgeHeader.data(), 0x200);
+        auto lastRva = DWORD(0x3000 - sizeof(Address));
+        writeValue(GetCurrentProcess(), base + lastRva, addresses[0]);
+        auto edgeOutput = folder.path / L"edge.exe";
+        d.dump(edgeOutput, base + lastRva, false);
+        auto edgeFile = readFile(edgeOutput);
+        PEImage edgeDump(edgeFile);
+        auto edgeIAT = edgeDump.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT];
+        test::require(edgeIAT.VirtualAddress == lastRva && edgeIAT.Size == sizeof(Address),
+                      "image-end IAT does not append an out-of-bounds terminator");
+        test::require(load<Address>(edgeFile, edgeDump.fileOffset(lastRva, sizeof(Address))) != addresses[0],
+                      "image-end API was rebuilt");
+        writeValue<Address>(GetCurrentProcess(), base + lastRva, 0);
+        // Hundreds of imports must grow .import beyond its initial page.
+        std::vector<Address> large(301);
+        for (std::size_t i = 0; i + 1 < large.size(); ++i)
+            large[i] = addresses[i % 2];
+        std::memcpy(reinterpret_cast<void *>(base + 0x2000), large.data(), large.size() * sizeof(Address));
+        auto largeOutput = folder.path / L"large.exe";
+        d.dump(largeOutput, base + 0x2000, false);
+        auto largeFile = readFile(largeOutput);
+        PEImage largeDump(largeFile);
+        const auto &largeSection = largeDump.sections.back().header;
+        test::require(largeSection.Misc.VirtualSize > 0x1000, "large import section grows past one page");
+        test::require(largeDump.nt.OptionalHeader.SizeOfImage ==
+                          largeDump.sectionAlign(largeSection.VirtualAddress + largeSection.Misc.VirtualSize),
+                      "large import image size is aligned and covers all names/thunks");
+        auto largeDir = largeDump.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        auto largeDescriptor = load<IMAGE_IMPORT_DESCRIPTOR>(
+            largeFile, largeDump.fileOffset(largeDir.VirtualAddress, sizeof(IMAGE_IMPORT_DESCRIPTOR)));
+        test::require(load<Address>(largeFile, largeDump.fileOffset(largeDescriptor.OriginalFirstThunk +
+                                                                        300 * sizeof(Address),
+                                                                    sizeof(Address))) == 0,
+                      "large lookup terminator is in bounds");
+        test::require(largeDump.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IAT].Size ==
+                          large.size() * sizeof(Address),
+                      "large IAT includes only the existing terminator");
+        std::memset(reinterpret_cast<void *>(base + 0x2000), 0, 0x1000);
+        std::memcpy(allocation, original.data(), 0x200);
         auto ntClose = reinterpret_cast<Address>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtClose"));
         test::require(ntClose && d.isAPI(ntClose), "second module fixture export resolves");
         const std::array<Address, 10> sparse{addresses[0], 0,          0x11223344, 0x55667788,   0,
@@ -373,8 +418,8 @@ void importDumpTests() {
         test::require(sparseDir.Size == 5 * sizeof(IMAGE_IMPORT_DESCRIPTOR),
                       "four sparse descriptors plus null descriptor");
         const std::array<std::size_t, 4> starts{0, 5, 7, 8};
-        for (auto slot : starts) {
-            auto i = std::size_t(std::find(starts.begin(), starts.end(), slot) - starts.begin());
+        for (std::size_t i = 0; i < starts.size(); ++i) {
+            auto slot = starts[i];
             auto desc = load<IMAGE_IMPORT_DESCRIPTOR>(
                 sparseFile,
                 sparsePE.fileOffset(sparseDir.VirtualAddress + i * sizeof(IMAGE_IMPORT_DESCRIPTOR),
@@ -456,18 +501,20 @@ class DebugProbe final : public DebuggerCore {
         soft_ = imageBase_ + reinterpret_cast<Address>(&fixtureSoft) - local;
         hardware_ = imageBase_ + reinterpret_cast<Address>(&fixtureHardware) - local;
         setSoftBP(soft_);
-        setBreakpoint(hardware_);
-        auto c = context(thread());
-        info(L"Probe armed: soft=0x" + hex(soft_) + L" hard=0x" + hex(hardware_) + L" DR0=0x" + hex(c.Dr0) +
-             L" DR7=0x" + hex(c.Dr7));
+        info(L"Probe software breakpoint armed at 0x" + hex(soft_));
         test::require(read<BYTE>(soft_) == 0xcc, "software breakpoint byte installed");
-        test::require(c.Dr0 == hardware_ && (c.Dr7 & 1), "hardware breakpoint registers installed");
     }
     SoftAction onSoftware(HANDLE, Address a) override {
         test::require(a == soft_, "software breakpoint address");
         softHit = true;
+        // Windows startup can restore the initial thread context after the
+        // loader breakpoint, clearing debug registers installed in onStart().
+        // Arm the hardware fixture at this first user-code stop instead. The
+        // trace below must now restore a genuinely enabled breakpoint.
+        setBreakpoint(hardware_);
         auto before = context(thread());
-        info(L"Probe software hit; DR6=0x" + hex(before.Dr6) + L" DR7=0x" + hex(before.Dr7));
+        info(L"Probe software hit; hardware armed: DR0=0x" + hex(before.Dr0) + L" DR7=0x" + hex(before.Dr7));
+        test::require(before.Dr0 == hardware_ && (before.Dr7 & 1), "hardware breakpoint registers installed");
         auto local = reinterpret_cast<Address>(GetModuleHandleW(nullptr));
         auto start = imageBase_ + reinterpret_cast<Address>(&fixtureTrace) - local;
         test::require(trace(start, 16, [](unsigned count, CONTEXT &) { return count >= 1; }),
