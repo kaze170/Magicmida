@@ -14,6 +14,7 @@ class DebuggerCore {
     std::map<Address, std::uint8_t> software_;
     Address reenable_{};
     bool initialBreak_ = true;
+    Address pebBase_{};
     bool active_ = false;
     DWORD pendingThread_{};
     void stopTarget() noexcept;

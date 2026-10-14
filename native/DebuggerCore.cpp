@@ -89,7 +89,9 @@ void DebuggerCore::created(const DEBUG_EVENT &e) {
     auto peb = reinterpret_cast<Address>(pbi.PebBaseAddress);
     info(L"Debug session: PID " + std::to_wstring(pid_) + L"; PEB 0x" + hex(peb) + L"; image base 0x" +
          hex(imageBase_));
-    write<std::uint8_t>(peb + 2, 0);
+    // Ldr checks BeingDebugged before issuing its initial breakpoint. Clearing
+    // it here would suppress the event on which onStart() depends.
+    pebBase_ = peb;
 #ifdef _WIN64
     constexpr Address shim = 0x2d8;
 #else
@@ -129,6 +131,8 @@ bool DebuggerCore::run() {
                 threads_.erase(e.dwThreadId);
                 break;
             case EXIT_PROCESS_DEBUG_EVENT:
+                if (initialBreak_)
+                    warning(L"Target exited before the loader breakpoint; unpacker was not initialized.");
                 info(L"Process ended: " + std::to_wstring(e.u.ExitProcess.dwExitCode));
                 exited = true;
                 break;
@@ -312,6 +316,8 @@ DWORD DebuggerCore::exception(const DEBUG_EVENT &e) {
         if (it == software_.end()) {
             if (initialBreak_) {
                 initialBreak_ = false;
+                write<BYTE>(pebBase_ + 2, 0);
+                info(L"Loader breakpoint reached; initializing unpacker.");
                 onStart();
                 updateAll();
                 return DBG_CONTINUE;

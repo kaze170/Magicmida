@@ -365,6 +365,7 @@ __declspec(noinline) int fixtureTrace(int value) {
 class DebugProbe final : public DebuggerCore {
     Address soft_{}, hardware_{};
     void onStart() override {
+        started = true;
         auto local = reinterpret_cast<Address>(GetModuleHandleW(nullptr));
         soft_ = imageBase_ + reinterpret_cast<Address>(&fixtureSoft) - local;
         hardware_ = imageBase_ + reinterpret_cast<Address>(&fixtureHardware) - local;
@@ -391,7 +392,7 @@ class DebugProbe final : public DebuggerCore {
     }
 
   public:
-    bool softHit = false, hardHit = false;
+    bool started = false, softHit = false, hardHit = false;
     using DebuggerCore::DebuggerCore;
 };
 void debuggerTests() {
@@ -400,7 +401,9 @@ void debuggerTests() {
         std::atomic_bool cancel = false;
         Logger logger = [](LogType, const std::wstring &text) { std::cout << narrow(text) << '\n'; };
         DebugProbe p(executablePath(), logger, cancel);
-        test::require(p.run(), "debug event loop finishes");
+        bool result = p.run();
+        test::require(p.started, "loader breakpoint must initialize debugger");
+        test::require(result, "debug event loop finishes");
         test::require(p.softHit && p.hardHit, "software and hardware callbacks observed");
         cancel = true;
         DebugProbe cancelled(executablePath(), logger, cancel);
