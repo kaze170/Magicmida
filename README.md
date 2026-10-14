@@ -96,8 +96,10 @@ Validation includes 10,532 portable checks, synthetic PE/TLS/layout tests,
 real Windows sparse-import binding, debugger/trace/cancellation integration,
 CLI checks, and starting a real MSVC test executable after section restoration
 and compaction. Linux cross-compilation is not Windows execution.
-The preceding IAT/debugger revision passed all four VS2026 CI configurations;
-the expanded section/cleanup revision requires its own CI result.
+The expanded section/native-only cleanup revision `e690b3e` passed all four
+VS2026 build, native integration and CLI configurations, including the reconstructed
+executable loader test: [Windows CI 38605840097](https://github.com/kaze170/Magicmida/actions/runs/38605840097).
+This does not replace regression testing on your actual protected targets.
 
 ## External runtime dependency and limits
 

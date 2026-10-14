@@ -106,7 +106,9 @@ Debug build 需要 debug CRT；部署 Release build 需要對應 Visual C++ runt
   （[CI 38601065569](https://github.com/kaze170/Magicmida/actions/runs/38601065569)）。使用者亦回報該目標正常。
 - 本次 section／原生清理：四組態 Linux Zig／Clang Windows target 編譯／完整連結通過；
   10,532 項 portable 檢查及 ASan／UBSan 通過。
-- 本次新增 Windows 測試須由對應 CI 驗證，不能以交叉編譯代替執行結果。
+- 本次 section／原生清理版本 `e690b3e`：真正 VS2026 四組態建置、native integration、CLI、
+  以及重建／壓縮後 EXE 的 Windows loader 啟動測試**全部通過**
+  （[CI 38605840097](https://github.com/kaze170/Magicmida/actions/runs/38605840097)）。
 - 授權目標的 Themida／ScyllaHide／TLS／OEP／DLL／.NET 完整回歸仍需要實際樣本，
   不能把單一目標成功推廣成全部目標等效。
 
