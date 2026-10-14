@@ -13,7 +13,7 @@
   <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration"><UseDebugLibraries>false</UseDebugLibraries></PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="PropertySheets"><Import Project="Native.Common.props" /></ImportGroup>
-  <ItemDefinitionGroup><ClCompile><CompileAs>CompileAsC</CompileAs><LanguageStandard>Default</LanguageStandard><ConformanceMode>false</ConformanceMode><WarningLevel>Level0</WarningLevel><SDLCheck>false</SDLCheck><PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;BEA_LACKS_SNPRINTF;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile></ItemDefinitionGroup>
+  <ItemDefinitionGroup><ClCompile><CompileAs>CompileAsC</CompileAs><LanguageStandard>Default</LanguageStandard><ConformanceMode>false</ConformanceMode><WarningLevel>TurnOffAllWarnings</WarningLevel><ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel><SDLCheck>false</SDLCheck><PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;BEA_LACKS_SNPRINTF;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile></ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="third_party\beaengine\src\BeaEngine.c" />
   </ItemGroup>

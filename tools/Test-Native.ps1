@@ -6,11 +6,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $bin = Join-Path $root "artifacts/bin/$Platform/$Configuration"
-$tests = Start-Process -FilePath (Join-Path $bin 'Magicmida.Tests.exe') -PassThru -NoNewWindow
+$stdout = Join-Path $bin 'native-tests.stdout.log'
+$stderr = Join-Path $bin 'native-tests.stderr.log'
+$tests = Start-Process -FilePath (Join-Path $bin 'Magicmida.Tests.exe') -PassThru -NoNewWindow -RedirectStandardOutput $stdout -RedirectStandardError $stderr
 if (-not $tests.WaitForExit(120000)) {
     $tests.Kill($true)
     throw 'Native tests timed out (120 seconds).'
 }
+Get-Content $stdout
+Get-Content $stderr
 if ($tests.ExitCode -ne 0) { throw "Native tests failed: $($tests.ExitCode)" }
 $exe = Join-Path $bin 'Magicmida.exe'
 function Assert-Exit([string]$Arguments, [int]$Expected) {

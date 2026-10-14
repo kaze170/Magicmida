@@ -32,6 +32,10 @@ def main():
     for project in sorted(projects):
         root = ET.parse(ROOT / project).getroot()
         require(root.findtext('m:PropertyGroup/m:PlatformToolset', namespaces=NS) == 'v145', f'{project}: toolset')
+        valid_warnings = {'TurnOffAllWarnings', 'Level1', 'Level2', 'Level3', 'Level4', 'EnableAllWarnings'}
+        for setting in ('WarningLevel', 'ExternalWarningLevel'):
+            for value in root.findall(f'.//m:{setting}', NS):
+                require(value.text in valid_warnings, f'{project}: invalid {setting}: {value.text}')
         configs = {p.attrib['Include'] for p in root.findall('m:ItemGroup/m:ProjectConfiguration', NS)}
         require(configs == {f'{c}|{p}' for c in ('Debug', 'Release') for p in ('Win32', 'x64')}, f'{project}: configuration matrix')
         filters = ET.parse(ROOT / (project + '.filters')).getroot()
