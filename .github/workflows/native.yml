@@ -32,14 +32,37 @@ jobs:
           vs-version: '[18.0,19.0)'
       - name: Build native solution
         shell: pwsh
-        run: >-
-          msbuild Magicmida.slnx /m /t:Build
-          /p:Configuration=${{ matrix.configuration }}
-          /p:Platform=${{ matrix.platform }}
-          /bl:artifacts/build-${{ matrix.platform }}-${{ matrix.configuration }}.binlog
+        run: |
+          New-Item -ItemType Directory -Force artifacts | Out-Null
+          $log = 'artifacts/msbuild-${{ matrix.platform }}-${{ matrix.configuration }}.log'
+          msbuild Magicmida.slnx /m /t:Build /p:Configuration=${{ matrix.configuration }} /p:Platform=${{ matrix.platform }} /bl:artifacts/build-${{ matrix.platform }}-${{ matrix.configuration }}.binlog 2>&1 | Tee-Object -FilePath $log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $errors = @(Get-Content $log | Select-String -Pattern 'error |fatal error|MSB[0-9]+' | Select-Object -Last 25)
+            if (-not $errors.Count) { $errors = @(Get-Content $log | Select-Object -Last 20) }
+            foreach ($line in $errors) {
+              $message = "$line".Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+              Write-Output "::error title=MSVC build diagnostic::$message"
+            }
+            exit $code
+          }
       - name: Test native core and CLI
         shell: pwsh
-        run: ./tools/Test-Native.ps1 -Platform '${{ matrix.platform }}' -Configuration '${{ matrix.configuration }}'
+        run: |
+          $log = 'artifacts/tests-${{ matrix.platform }}-${{ matrix.configuration }}.log'
+          try {
+            ./tools/Test-Native.ps1 -Platform '${{ matrix.platform }}' -Configuration '${{ matrix.configuration }}' *>&1 | Tee-Object -FilePath $log
+          } catch {
+            $message = "$($_.Exception.Message)".Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Native test failure::$message"
+            if (Test-Path $log) {
+              foreach ($line in (Get-Content $log | Select-Object -Last 20)) {
+                $message = "$line".Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+                Write-Output "::error title=Native test diagnostic::$message"
+              }
+            }
+            exit 1
+          }
       - name: Upload binaries and build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -48,4 +71,5 @@ jobs:
           path: |
             artifacts/bin/${{ matrix.platform }}/${{ matrix.configuration }}/
             artifacts/build-${{ matrix.platform }}-${{ matrix.configuration }}.binlog
+            artifacts/*-${{ matrix.platform }}-${{ matrix.configuration }}.log
           if-no-files-found: warn
