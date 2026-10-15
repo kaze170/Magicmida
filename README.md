@@ -95,7 +95,7 @@ GUI/CLI application, native core library, BeaEngine, and native tests. Runtime:
 Windows 10/11 with the matching Visual C++ runtime (Debug builds need the debug CRT).
 Windows XP is not supported.
 
-Validation includes 10,532 portable checks, synthetic PE/TLS/layout tests,
+Validation includes 21,866 portable checks, synthetic PE/TLS/layout tests,
 real Windows sparse-import binding, debugger/trace/cancellation integration,
 CLI checks, and starting a real MSVC test executable after section restoration
 and compaction. Linux cross-compilation is not Windows execution.

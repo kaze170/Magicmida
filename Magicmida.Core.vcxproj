@@ -32,6 +32,7 @@
     <ClInclude Include="native\Dumper.hpp" />
     <ClInclude Include="native\ImportPlan.hpp" />
     <ClInclude Include="native\OneCoreUAP.hpp" />
+    <ClInclude Include="native\SectionLayout.hpp" />
     <ClInclude Include="native\PEInfo.hpp" />
     <ClInclude Include="native\Patcher.hpp" />
     <ClInclude Include="native\Themida.hpp" />

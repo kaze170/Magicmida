@@ -18,6 +18,7 @@
     <ClInclude Include="native\Dumper.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\ImportPlan.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\OneCoreUAP.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="native\SectionLayout.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\PEInfo.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\Patcher.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="native\Themida.hpp"><Filter>Header Files</Filter></ClInclude>

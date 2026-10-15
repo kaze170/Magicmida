@@ -159,3 +159,17 @@ Portable 子集不依賴 C++26 特性；Windows 專案仍使用 `/std:c++latest`
 - 本輪程式版本 `d3278df` 已通過 Win32／x64 × Debug／Release 的真正 MSVC 建置、
   native／CLI 回歸與兩輪後處理後 EXE 啟動測試；portable 10,532 項及本機 ASan／UBSan 亦通過。
   [本輪 CI 38714773976](https://github.com/kaze170/Magicmida/actions/runs/38714773976)。
+
+## 新增 section 與原子寫入加強
+
+- 新增 section 的 placement 改為獨立、可在 Linux 執行測試的規劃邏輯：檢查所有 section
+  的最大 raw／virtual extent，保留既有 SizeOfImage，不再假設最後一個 header 位於檔案末端。
+  BSS 的空 raw pointer 不再使新增 section 指向 PE headers。配置前檢查對齊、整數溢位、
+  空表及 96-section 上限；payload／overlay 的安排仍由呼叫端負責。
+- PE header 儲存先檢查完整表格與數量；失敗前不修改輸出 buffer。解析時先檢查完整 section
+  table，再一次保留所需 vector 容量，減少重複配置。
+- 原子輸出改用同目錄的短暫存檔名與 process-wide atomic sequence；CREATE_NEW 撞名時
+  有限重試，不刪除他人的檔案。短名稱也避免目標 basename 接近長度上限時附加 suffix 失敗。
+  並行操作仍可能遭 Windows 拒絕 rename，會回報錯誤；不保證每個競爭寫入都成功。
+- Portable 檢查增加到 21,866 項，含隨機 section 配置。Windows 新增並行寫入、鎖定目標
+  失敗保留原檔、空檔替換、長 basename 與暫存檔清理測試。本輪 Windows 結果待對應 CI。

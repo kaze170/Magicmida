@@ -47,6 +47,9 @@ PEImage::PEImage(std::span<const std::uint8_t> image) {
         throw std::runtime_error("Unsupported or malformed PE header");
     fileAlign(0);
     sectionAlign(0);
+    bounds(image.size(), ntOffset,
+           sizeof(nt) + std::size_t(nt.FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER));
+    sections.reserve(nt.FileHeader.NumberOfSections);
     for (unsigned i = 0; i < nt.FileHeader.NumberOfSections; ++i) {
         Section s{
             load<IMAGE_SECTION_HEADER>(image, ntOffset + sizeof(nt) + i * sizeof(IMAGE_SECTION_HEADER))};
@@ -118,7 +121,9 @@ void PEImage::sanitize() {
     sections.front().header.Characteristics |= IMAGE_SCN_MEM_WRITE;
 }
 void PEImage::save(Bytes &image) const {
-    auto end = std::size_t(ntOffset) + sizeof(nt) + sections.size() * sizeof(IMAGE_SECTION_HEADER);
+    if (sections.empty() || sections.size() > maxPESections)
+        throw std::runtime_error("Cannot save: invalid PE section count");
+    auto end = std::uint64_t(ntOffset) + sizeof(nt) + sections.size() * sizeof(IMAGE_SECTION_HEADER);
     if (end > nt.OptionalHeader.SizeOfHeaders)
         throw std::runtime_error("No space for new section headers");
     bounds(image.size(), 0, nt.OptionalHeader.SizeOfHeaders);
@@ -129,23 +134,32 @@ void PEImage::save(Bytes &image) const {
         store(image, ntOffset + sizeof(nt) + i * sizeof(IMAGE_SECTION_HEADER), sections[i].header);
     // Clear only obsolete section headers, not arbitrary header padding which
     // may contain live directory data.
-    auto oldEnd = std::size_t(ntOffset) + sizeof(nt) +
+    auto oldEnd = std::uint64_t(ntOffset) + sizeof(nt) +
                   std::size_t(nt.FileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER);
     if (oldEnd > end && oldEnd <= hdr.OptionalHeader.SizeOfHeaders)
         std::fill(image.begin() + end, image.begin() + oldEnd, 0);
 }
 Section &PEImage::append(std::string_view name, DWORD size) {
-    auto last = sections.back().header;
+    if (sections.size() >= maxPESections)
+        throw std::runtime_error("Cannot append: PE section table is full");
+    std::array<SectionExtent, maxPESections> extents{};
+    for (std::size_t i = 0; i < sections.size(); ++i) {
+        const auto &h = sections[i].header;
+        extents[i] = {h.VirtualAddress, h.Misc.VirtualSize, h.PointerToRawData, h.SizeOfRawData};
+    }
+    auto plan = planSectionAppend(std::span(extents).first(sections.size()), nt.OptionalHeader.SizeOfHeaders,
+                                  nt.OptionalHeader.SizeOfImage, nt.OptionalHeader.FileAlignment,
+                                  nt.OptionalHeader.SectionAlignment, size);
     Section s;
     s.rename(name);
-    s.header.VirtualAddress = sectionAlign(
-        rva32(std::uint64_t(last.VirtualAddress) + std::max(last.Misc.VirtualSize, last.SizeOfRawData)));
+    s.header.VirtualAddress = plan.virtualAddress;
     s.header.Misc.VirtualSize = size;
-    s.header.SizeOfRawData = fileAlign(size);
-    s.header.PointerToRawData = fileAlign(rva32(std::uint64_t(last.PointerToRawData) + last.SizeOfRawData));
+    s.header.SizeOfRawData = plan.rawSize;
+    s.header.PointerToRawData = plan.rawOffset;
     s.header.Characteristics = IMAGE_SCN_MEM_READ | IMAGE_SCN_CNT_INITIALIZED_DATA;
-    nt.OptionalHeader.SizeOfImage = sectionAlign(rva32(std::uint64_t(s.header.VirtualAddress) + size));
+    // Publish SizeOfImage only after vector insertion succeeds.
     sections.push_back(s);
+    nt.OptionalHeader.SizeOfImage = plan.imageSize;
     return sections.back();
 }
 void PEImage::switchManifest(Bytes &image, DWORD from, DWORD to) const {

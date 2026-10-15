@@ -3,6 +3,8 @@
 #include "ThemidaCommon.hpp"
 #include "Patcher.hpp"
 #include <iostream>
+#include <latch>
+#include <thread>
 using namespace mm;
 namespace {
 Bytes fixture() {
@@ -112,6 +114,48 @@ void peTests() {
         full.append(".extra", 0x1000);
     rejects([&] { full.save(small); }, "section table overflow rejected");
 }
+void sectionAppendTests() {
+    auto source = fixture();
+    PEImage pe(source);
+    pe.sections[0].header.PointerToRawData = 0x1000;
+    pe.sections[1].header.PointerToRawData = 0x200;
+    auto &appended = pe.append(".new", 0x123);
+    test::require(appended.header.PointerToRawData == 0x1600,
+                  "native append follows greatest raw end, not final header");
+    test::require(appended.header.VirtualAddress == 0x3000 && pe.nt.OptionalHeader.SizeOfImage == 0x4000,
+                  "native append updates image size");
+    auto bss = PEImage(source);
+    bss.sections.back().header.SizeOfRawData = 0;
+    bss.sections.back().header.PointerToRawData = 0;
+    test::require(bss.append(".new", 1).header.PointerToRawData == 0x800,
+                  "native BSS-ending image appends after real file-backed data");
+    auto reserved = PEImage(source);
+    reserved.nt.OptionalHeader.SizeOfImage = 0x9000;
+    test::require(reserved.append(".new", 1).header.VirtualAddress == 0x9000,
+                  "native append retains declared image reservation");
+    auto fail = PEImage(source);
+    fail.nt.OptionalHeader.SizeOfImage = 0xfffff000u;
+    auto oldSize = fail.nt.OptionalHeader.SizeOfImage;
+    test::rejects([&] { fail.append(".bad", 0x1000); }, "append virtual overflow rejected");
+    test::require(fail.sections.size() == 2 && fail.nt.OptionalHeader.SizeOfImage == oldSize,
+                  "failed append does not mutate section table or image size");
+    auto empty = PEImage(source);
+    empty.sections.clear();
+    test::rejects([&] { empty.append(".bad", 1); }, "append on empty table fails safely");
+    auto unchanged = source;
+    test::rejects([&] { empty.save(source); }, "save cannot emit a zero-section PE");
+    test::require(source == unchanged, "invalid save is rejected before changing bytes");
+    auto crowded = PEImage(source);
+    crowded.sections.resize(maxPESections + 1);
+    test::rejects([&] { crowded.save(source); }, "save rejects too many sections");
+    test::require(source == unchanged, "excessive-section save leaves buffer intact");
+    crowded.sections.resize(maxPESections);
+    test::rejects([&] { crowded.append(".bad", 1); }, "append enforces loader section limit");
+    auto shortHeader = PEImage(source);
+    shortHeader.nt.OptionalHeader.SizeOfHeaders = 0x100;
+    test::rejects([&] { shortHeader.save(source); }, "save preflights full header extent");
+    test::require(source == unchanged, "header-capacity failure leaves buffer intact");
+}
 void manifestTests() {
     using test::rejects;
     using test::require;
@@ -208,6 +252,82 @@ void fileTests() {
     test::require(unpackedPath(Path(L"C:\\space path\\target.dll")) == Path(L"C:\\space path\\targetU.dll"),
                   "U output suffix");
     test::require(widen(narrow(L"繁體中文 Δ")) == L"繁體中文 Δ", "UTF-8 roundtrip");
+}
+void concurrentFileTests() {
+    TemporaryFolder folder;
+    auto file = folder.path / L"parallel output.bin";
+    constexpr std::size_t workers = 8;
+    std::array<std::string, workers> failures;
+    std::latch start(1);
+    std::vector<std::jthread> writers;
+    try {
+        for (std::size_t i = 0; i < workers; ++i)
+            writers.emplace_back([&, i] {
+                try {
+                    Bytes content((1 << 20) + 31 * i, BYTE(i + 1));
+                    start.wait();
+                    writeFileAtomic(file, content);
+                } catch (const std::exception &e) {
+                    failures[i] = e.what();
+                }
+            });
+    } catch (...) {
+        start.count_down();
+        throw;
+    }
+    start.count_down();
+    for (auto &writer : writers)
+        writer.join();
+    std::size_t successes = 0;
+    for (const auto &failure : failures) {
+        if (failure.empty()) {
+            ++successes;
+            continue;
+        }
+        // Windows can refuse a contested rename. It must not fail because
+        // writers shared a temporary name, nor leave a partial destination.
+        test::require(failure == "MoveFileEx (Windows error 32)" || failure == "MoveFileEx (Windows error 5)",
+                      "concurrent writers must obtain independently owned temporary files");
+    }
+    test::require(successes > 0, "at least one concurrent atomic replacement completes");
+    auto result = readFile(file);
+    test::require(!result.empty() && result[0] >= 1 && result[0] <= workers,
+                  "concurrent output belongs to a writer");
+    auto winner = std::size_t(result[0] - 1);
+    test::require(failures[winner].empty() && result.size() == (1 << 20) + 31 * winner &&
+                      std::all_of(result.begin(), result.end(), [&](BYTE b) { return b == result[0]; }),
+                  "atomic replacement preserves exactly one complete payload, without mixed/trailing bytes");
+    std::size_t files = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(folder.path)) {
+        (void)entry;
+        ++files;
+    }
+    test::require(files == 1, "concurrent writes clean up all owned temporary files");
+    Handle locked(CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                              FILE_ATTRIBUTE_NORMAL, nullptr));
+    test::require(bool(locked), "hold replacement target open without delete sharing");
+    test::rejects([&] { writeFileAtomic(file, Bytes{1, 2, 3}); }, "locked target rejects replacement");
+    locked.reset();
+    test::require(readFile(file) == result, "failed locked-file replacement preserves original bytes");
+    writeFileAtomic(file, {});
+    test::require(readFile(file).empty(), "zero-length atomic replacement truncates fully");
+    files = 0;
+    for (const auto &entry : std::filesystem::directory_iterator(folder.path)) {
+        (void)entry;
+        ++files;
+    }
+    test::require(files == 1, "replacement failure and zero-length success leave no temporary files");
+    // Extended-length syntax isolates the filename-component limit from the
+    // process manifest's MAX_PATH policy. The target name itself is valid.
+    auto longName = std::filesystem::absolute(folder.path / (std::wstring(240, L'a') + L".bin")).wstring();
+    if (!longName.starts_with(L"\\\\?\\"))
+        longName =
+            longName.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + longName.substr(2) : L"\\\\?\\" + longName;
+    const Path longPath(longName);
+    const Bytes marker{7, 8, 9};
+    writeFileAtomic(longPath, marker);
+    test::require(readFile(longPath) == marker, "atomic output supports a near-limit target basename");
+    check(DeleteFileW(longPath.c_str()), "DeleteFile(long-name fixture)");
 }
 Bytes sectionFixture(bool reference) {
     auto bytes = fixture();
@@ -969,10 +1089,12 @@ int main() {
     try {
         portableTests();
         peTests();
+        sectionAppendTests();
         manifestTests();
         trimTests();
         disassemblyTests();
         fileTests();
+        concurrentFileTests();
         mappedReadTests();
         patcherTests();
         compactionLayoutTests();

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #pragma once
 #include "Utils.hpp"
+#include "SectionLayout.hpp"
 namespace mm {
 struct Section {
     IMAGE_SECTION_HEADER header{};

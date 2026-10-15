@@ -3,6 +3,7 @@
 #include "Binary.hpp"
 #include "OneCoreUAP.hpp"
 #include "ImportPlan.hpp"
+#include "SectionLayout.hpp"
 #include <array>
 #include <random>
 using namespace mm;
@@ -137,6 +138,78 @@ void portableTests() {
         }
         candidates[a] = {{"", "Alpha"}};
         rejects([&] { planImports(normal, candidates, {}); }, "invalid candidate not silently discarded");
+    }
+    {
+        std::vector<SectionExtent> sections{{0x1000, 0x1000, 0x2000, 0x400}, {0x2000, 0x1000, 0x400, 0x200}};
+        auto plan = [&](std::uint32_t size = 0x123) {
+            return planSectionAppend(sections, 0x400, 0x3000, 0x200, 0x1000, size);
+        };
+        auto p = plan();
+        require(p.rawOffset == 0x2400 && p.virtualAddress == 0x3000 && p.rawSize == 0x200 &&
+                    p.imageSize == 0x4000,
+                "append uses maximum extents rather than final header");
+        sections.push_back({0x3000, 0x1000, 0, 0});
+        p = plan();
+        require(p.rawOffset == 0x2400 && p.virtualAddress == 0x4000,
+                "BSS tail cannot reset raw append position to zero");
+        std::reverse(sections.begin(), sections.end());
+        require(plan().rawOffset == p.rawOffset && plan().virtualAddress == p.virtualAddress,
+                "append placement is independent of header ordering");
+        require(planSectionAppend(sections, 0x400, 0x9000, 0x200, 0x1000, 1).virtualAddress == 0x9000,
+                "append does not reduce reserved image extent");
+        sections = {{0x1000, 0x2000, 0xfffffff0u, 0}};
+        require(plan().rawOffset == 0x400, "raw-empty BSS ignores unused raw pointer and retains headers");
+        rejects([&] { plan(0); }, "empty appended section rejected");
+        rejects([&] { planSectionAppend(sections, 0x400, 0x3000, 3, 0x1000, 1); },
+                "invalid append file alignment rejected");
+        rejects([&] { planSectionAppend(sections, 0x400, 0x3000, 0x200, 0, 1); },
+                "invalid append section alignment rejected");
+        rejects([&] { planSectionAppend(sections, 0x400, 0xfffff000u, 0x200, 0x1000, 0x1000); },
+                "new virtual extent overflow rejected");
+        sections = {{0x1000, 0x1000, 0xffffff00u, 0x200}};
+        rejects([&] { plan(); }, "existing raw extent overflow rejected");
+        sections = {{0xfffff000u, 0x2000, 0x400, 0x200}};
+        rejects([&] { plan(); }, "existing virtual extent overflow rejected");
+        sections = {{0x1000, 0x1000, 0xffffe000u, 0x1000}};
+        rejects([&] { plan(0x2000); }, "new raw extent overflow rejected");
+        sections.clear();
+        rejects([&] { plan(); }, "empty section table rejected");
+        sections.resize(maxPESections);
+        rejects([&] { plan(); }, "full section table rejected");
+        std::mt19937 rng(20261015);
+        for (unsigned iteration = 0; iteration < 250; ++iteration) {
+            sections.clear();
+            std::uint64_t expectedVirtual = 0x5000, expectedRaw = 0x400;
+            auto count = 1 + rng() % 40;
+            for (unsigned i = 0; i < count; ++i) {
+                SectionExtent h{std::uint32_t(0x1000 + i * 0x2000), std::uint32_t(1 + rng() % 0x1000),
+                                std::uint32_t(0x400 + (count - i) * 0x2000),
+                                std::uint32_t((rng() % 5) * 0x200)};
+                if (!h.rawSize)
+                    h.rawOffset = 0;
+                expectedVirtual = std::max(expectedVirtual, std::uint64_t(h.virtualAddress) +
+                                                                std::max(h.virtualSize, h.rawSize));
+                if (h.rawSize)
+                    expectedRaw = std::max(expectedRaw, std::uint64_t(h.rawOffset) + h.rawSize);
+                sections.push_back(h);
+            }
+            std::shuffle(sections.begin(), sections.end(), rng);
+            std::uint32_t size = 1 + rng() % 0x2000;
+            p = planSectionAppend(sections, 0x400, 0x5000, 0x200, 0x1000, size);
+            require(p.virtualAddress == ((expectedVirtual + 0xfff) & ~std::uint64_t(0xfff)),
+                    "randomized virtual append placement");
+            require(p.rawOffset == ((expectedRaw + 0x1ff) & ~std::uint64_t(0x1ff)),
+                    "randomized raw append placement");
+            require(p.rawSize >= size && p.rawSize % 0x200 == 0 && p.imageSize % 0x1000 == 0,
+                    "randomized append alignment");
+            for (const auto &h : sections) {
+                require(p.virtualAddress >=
+                            std::uint64_t(h.virtualAddress) + std::max(h.virtualSize, h.rawSize),
+                        "appended RVA does not overlap any prior section");
+                require(!h.rawSize || p.rawOffset >= std::uint64_t(h.rawOffset) + h.rawSize,
+                        "appended raw range does not overlap any prior section");
+            }
+        }
     }
     std::mt19937 random(0x170);
     // Exercise boundary matches and absent patterns against a simple reference.

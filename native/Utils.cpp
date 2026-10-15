@@ -69,13 +69,28 @@ Bytes readFile(const Path &path) {
     return data;
 }
 void writeFileAtomic(const Path &path, std::span<const std::uint8_t> data) {
-    auto temp = path;
-    temp +=
-        L".mm-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L".tmp";
-    Handle h(
-        CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+    static std::atomic<std::uint64_t> sequence{0};
+    auto prefix =
+        L".mm-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()) + L"-";
+    Path temp;
+    Handle h;
+    DWORD error = ERROR_FILE_EXISTS;
+    for (unsigned attempt = 0; attempt < 64; ++attempt) {
+        // A short sibling name also works when the target basename is near
+        // the filesystem's per-component limit (appending a suffix would fail).
+        temp = path.parent_path() /
+               (prefix + std::to_wstring(sequence.fetch_add(1, std::memory_order_relaxed)) + L".tmp");
+        h.reset(
+            CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (h)
+            break;
+        error = GetLastError();
+        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS)
+            winError("CreateFile(output)", error);
+        // Never remove someone else's file on a collision. Try a fresh name.
+    }
     if (!h)
-        winError("CreateFile(output)");
+        winError("CreateFile(unique output)", error);
     try {
         for (std::size_t done = 0; done < data.size();) {
             DWORD n{};
