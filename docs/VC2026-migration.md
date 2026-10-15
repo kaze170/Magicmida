@@ -172,4 +172,6 @@ Portable 子集不依賴 C++26 特性；Windows 專案仍使用 `/std:c++latest`
   有限重試，不刪除他人的檔案。短名稱也避免目標 basename 接近長度上限時附加 suffix 失敗。
   並行操作仍可能遭 Windows 拒絕 rename，會回報錯誤；不保證每個競爭寫入都成功。
 - Portable 檢查增加到 21,866 項，含隨機 section 配置。Windows 新增並行寫入、鎖定目標
-  失敗保留原檔、空檔替換、長 basename 與暫存檔清理測試。本輪 Windows 結果待對應 CI。
+  失敗保留原檔、空檔替換、長 basename 與暫存檔清理測試。
+- 本輪程式版本 `10be695` 已通過四組態真正 MSVC 建置、native／CLI 測試；本機 ASan／UBSan
+  與交叉建置亦通過。[CI 38722381328](https://github.com/kaze170/Magicmida/actions/runs/38722381328)。

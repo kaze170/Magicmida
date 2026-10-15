@@ -47,6 +47,9 @@ See [繁體中文說明與驗證紀錄](docs/VC2026-migration.md).
 Back up files before section editing/compaction: these operations overwrite the
 selected file atomically and invalidate existing signatures. Certificate directory
 entries are cleared; overlay bytes are retained, not re-signed or interpreted.
+Atomic output uses independently named, short sibling temporary files. A locked
+destination or contested rename can still fail; callers receive an error rather
+than a partial destination file. Concurrent writes are not guaranteed all to succeed.
 
 ## CLI
 
@@ -99,10 +102,11 @@ Validation includes 21,866 portable checks, synthetic PE/TLS/layout tests,
 real Windows sparse-import binding, debugger/trace/cancellation integration,
 CLI checks, and starting a real MSVC test executable after section restoration
 and compaction. Linux cross-compilation is not Windows execution.
-The mapped-TLS/compaction revision `d3278df` passed all four VS2026 build,
-native integration and CLI configurations, including launching a test executable
-after two layout/compaction cycles:
-[Windows CI 38714773976](https://github.com/kaze170/Magicmida/actions/runs/38714773976).
+The section-placement/atomic-output revision `10be695` passed all four VS2026
+build, native integration and CLI configurations, including concurrent/locked-file
+output tests, long basenames, and launching a test executable after two
+layout/compaction cycles:
+[Windows CI 38722381328](https://github.com/kaze170/Magicmida/actions/runs/38722381328).
 This does not replace regression testing on your actual protected targets.
 
 ## External runtime dependency and limits
