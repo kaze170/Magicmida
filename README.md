@@ -33,7 +33,10 @@ See [繁體中文說明與驗證紀錄](docs/VC2026-migration.md).
 - **Compact (keep all sections)** / `/shrink`: removes raw padding and zero tails
   while retaining virtual extents, all sections (including VM code), overlay bytes,
   and debug data. Updates debug file offsets. Refuses nonzero raw gaps and unsupported
-  COFF metadata rather than silently discarding them. This is **not** the old
+  COFF metadata rather than silently discarding them. Output offsets/size are planned
+  before allocating the output buffer, avoiding repeated growth and copying.
+  TLS validation recognizes mapped zero tails after trimming, without accepting
+  truncated raw bytes or unmapped holes. This is **not** the old
   section-deleting shrink operation and does not devirtualize code.
 - **Dump process**: copies file-backed executable sections from the main module of
   a matching process, using its actual ASLR base, into a separate `.novm` output.
@@ -96,9 +99,10 @@ Validation includes 10,532 portable checks, synthetic PE/TLS/layout tests,
 real Windows sparse-import binding, debugger/trace/cancellation integration,
 CLI checks, and starting a real MSVC test executable after section restoration
 and compaction. Linux cross-compilation is not Windows execution.
-The expanded section/native-only cleanup revision `e690b3e` passed all four
-VS2026 build, native integration and CLI configurations, including the reconstructed
-executable loader test: [Windows CI 38605840097](https://github.com/kaze170/Magicmida/actions/runs/38605840097).
+The mapped-TLS/compaction revision `d3278df` passed all four VS2026 build,
+native integration and CLI configurations, including launching a test executable
+after two layout/compaction cycles:
+[Windows CI 38714773976](https://github.com/kaze170/Magicmida/actions/runs/38714773976).
 This does not replace regression testing on your actual protected targets.
 
 ## External runtime dependency and limits

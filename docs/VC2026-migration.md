@@ -156,4 +156,6 @@ Portable 子集不依賴 C++26 特性；Windows 專案仍使用 `/std:c++latest`
 - 新增 TLS terminator 剛好落在 FileAlignment 邊界、virtual-only callback list、
   重新套用 layout／compact 循環，以及 40-section 反序 raw layout／BSS／overlay 測試。
   CLI loader 測試也改為連續完成兩輪處理後再啟動 EXE。
-- 本輪新增項目的 Windows 執行結果需以本輪對應 CI 為準；前述歷史 CI 不代替本輪驗證。
+- 本輪程式版本 `d3278df` 已通過 Win32／x64 × Debug／Release 的真正 MSVC 建置、
+  native／CLI 回歸與兩輪後處理後 EXE 啟動測試；portable 10,532 項及本機 ASan／UBSan 亦通過。
+  [本輪 CI 38714773976](https://github.com/kaze170/Magicmida/actions/runs/38714773976)。
