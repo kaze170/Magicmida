@@ -143,3 +143,17 @@ Portable 子集不依賴 C++26 特性；Windows 專案仍使用 `/std:c++latest`
 - 仍不承諾完整 VM anti-dump／devirtualization；輸出 DLL 可能缺 relocation。
 - 保留的 IAT 未分類資料可能仍是未解析匯入；必須實際執行輸出驗證。
 - section 權限恢復、TLS 與自訂 overlay 使用方式都需要同一目標的回歸測試。
+
+## 後續 PE 後處理加強
+
+- TLS directory／callback 以映射後的 RVA 讀取：原本的 BSS、壓縮後的 virtual zero tail
+  視為零值；截斷的 file-backed bytes、未映射空洞與越過 SizeOfImage 則仍拒絕。
+  原本 `fileOffset` 的實體檔案範圍檢查不放寬。
+- TLS template 額外驗證起訖與完整區間，拒絕倒置、越界或跨越空洞的配置；exclusive end
+  可以恰好等於 image end。驗證區間不會先配置與範圍等大的 buffer。
+- Compact 先規劃所有輸出 offset／總長度，再配置一次輸出 buffer，避免反覆擴容與搬移。
+  尚無速度百分比的 benchmark，不宣稱特定加速倍數。
+- 新增 TLS terminator 剛好落在 FileAlignment 邊界、virtual-only callback list、
+  重新套用 layout／compact 循環，以及 40-section 反序 raw layout／BSS／overlay 測試。
+  CLI loader 測試也改為連續完成兩輪處理後再啟動 EXE。
+- 本輪新增項目的 Windows 執行結果需以本輪對應 CI 為準；前述歷史 CI 不代替本輪驗證。

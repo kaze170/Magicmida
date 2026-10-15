@@ -9,6 +9,8 @@ struct Section {
 };
 Bytes readPEHeader(HANDLE process, Address base);
 class PEImage {
+    void accessMapped(std::span<const BYTE> file, DWORD rva, std::size_t length, BYTE *output) const;
+
   public:
     DWORD ntOffset{};
     IMAGE_NT_HEADERS nt{};
@@ -16,6 +18,17 @@ class PEImage {
     explicit PEImage(std::span<const std::uint8_t> header);
     std::optional<std::size_t> sectionAt(DWORD rva) const;
     std::size_t fileOffset(DWORD rva, std::size_t length = 1) const;
+    // Interpret a declared mapped image, not a raw-file offset: virtual tails
+    // are zero-filled, but holes and truncated file-backed bytes are errors.
+    void validateMappedRange(std::span<const BYTE> file, DWORD rva, std::size_t length) const {
+        accessMapped(file, rva, length, nullptr);
+    }
+    template <class T> T mappedValue(std::span<const BYTE> file, DWORD rva) const {
+        static_assert(std::is_trivially_copyable_v<T>);
+        T value{};
+        accessMapped(file, rva, sizeof(T), reinterpret_cast<BYTE *>(&value));
+        return value;
+    }
     DWORD fileAlign(DWORD n) const { return alignUp(n, nt.OptionalHeader.FileAlignment); }
     DWORD sectionAlign(DWORD n) const { return alignUp(n, nt.OptionalHeader.SectionAlignment); }
     void sanitize();

@@ -79,6 +79,36 @@ std::size_t PEImage::fileOffset(DWORD rva, std::size_t n) const {
     bounds(s.SizeOfRawData, delta, n);
     return std::size_t(s.PointerToRawData) + delta;
 }
+void PEImage::accessMapped(std::span<const BYTE> file, DWORD rva, std::size_t length, BYTE *output) const {
+    bounds(nt.OptionalHeader.SizeOfImage, rva, length);
+    std::size_t completed = 0;
+    while (completed < length) {
+        auto current = rva32(std::uint64_t(rva) + completed);
+        std::size_t count, backed, offset;
+        if (current < nt.OptionalHeader.SizeOfHeaders) {
+            count = std::min<std::size_t>(length - completed, nt.OptionalHeader.SizeOfHeaders - current);
+            backed = count;
+            offset = current;
+        } else {
+            auto index = sectionAt(current);
+            if (!index)
+                throw std::runtime_error("Mapped RVA range crosses a section gap");
+            const auto &h = sections[*index].header;
+            auto delta = current - h.VirtualAddress;
+            count = std::min<std::size_t>(length - completed,
+                                          std::max(h.Misc.VirtualSize, h.SizeOfRawData) - delta);
+            backed = delta < h.SizeOfRawData ? std::min<std::size_t>(count, h.SizeOfRawData - delta) : 0;
+            offset = backed ? rva32(std::uint64_t(h.PointerToRawData) + delta) : 0;
+        }
+        bounds(file.size(), offset, backed); // missing raw bytes are NOT BSS
+        if (output) {
+            if (backed)
+                std::memcpy(output + completed, file.data() + offset, backed);
+            std::fill(output + completed + backed, output + completed + count, BYTE(0));
+        }
+        completed += count;
+    }
+}
 void PEImage::sanitize() {
     for (auto &s : sections) {
         s.header.PointerToRawData = s.header.VirtualAddress;

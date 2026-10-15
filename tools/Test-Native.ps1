@@ -50,6 +50,9 @@ try {
     Copy-Item $reference $edited
     Assert-Exit "/create-data `"$edited`" --reference `"$reference`"" 0
     Assert-Exit "/shrink `"$edited`"" 0
+    # Reapply after zero-tail trimming: TLS metadata must be read as mapped data.
+    Assert-Exit "/create-data `"$edited`" --reference `"$reference`"" 0
+    Assert-Exit "/shrink `"$edited`"" 0
     $env:MAGICMIDA_TEST_CHILD = '1'
     $p = Start-Process -FilePath $edited -PassThru -NoNewWindow
     if (-not $p.WaitForExit(30000)) { $p.Kill($true); throw 'Reconstructed executable timed out.' }

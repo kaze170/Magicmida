@@ -262,6 +262,41 @@ Bytes mappedPayload(const Bytes &bytes) {
     }
     return mapped;
 }
+void mappedReadTests() {
+    auto bytes = sectionFixture(true);
+    PEImage pe(bytes);
+    test::require(pe.mappedValue<WORD>(bytes, 0) == IMAGE_DOS_SIGNATURE,
+                  "mapped read includes file-backed headers");
+    bytes[0x5ff] = 0xa5;
+    test::require(pe.mappedValue<WORD>(bytes, 0x11ff) == 0x00a5,
+                  "mapped read crosses raw data into zero fill");
+    test::require(pe.mappedValue<Address>(bytes, 0x4000) == 0,
+                  "BSS is read as virtual zeros, not bytes at raw offset zero");
+    bytes[0x600] = 0x5a;
+    auto across = pe.mappedValue<std::array<BYTE, 8>>(bytes, 0x1ffc);
+    test::require(across[0] == 0 && across[3] == 0 && across[4] == 0x5a && across[7] == 0,
+                  "mapped read crosses adjacent sections without assuming contiguous raw offsets");
+    test::rejects([&] { pe.fileOffset(0x1200, sizeof(Address)); },
+                  "raw-file accessor remains strict for virtual-only data");
+    test::rejects([&] { pe.mappedValue<BYTE>(bytes, 0x800); },
+                  "header-to-section hole is not treated as BSS");
+    test::rejects([&] { pe.mappedValue<Address>(bytes, 0x5fff); }, "mapped value cannot cross SizeOfImage");
+    test::rejects([&] { pe.mappedValue<Address>(bytes, 0xfffffffcu); }, "mapped value overflow rejected");
+    pe.validateMappedRange(bytes, 0x6000, 0);
+    pe.validateMappedRange(bytes, 0x1000, 0x5000);
+    test::rejects([&] { pe.validateMappedRange(bytes, 0x1000, SIZE_MAX); },
+                  "mapped validation rejects size overflow without allocating");
+    auto shortFile = bytes;
+    shortFile.resize(0x500);
+    test::rejects([&] { pe.mappedValue<BYTE>(shortFile, 0x1100); },
+                  "truncated file-backed bytes are not fabricated as zeros");
+    auto hole = pe;
+    hole.sections.erase(hole.sections.begin() + 1);
+    test::rejects([&] { hole.mappedValue<std::array<BYTE, 8>>(bytes, 0x1ffc); },
+                  "mapped cross-section read refuses an unmapped hole");
+    test::rejects([&] { hole.validateMappedRange(bytes, 0x1000, 0x3000); },
+                  "range validation checks the entire interval, not only endpoints");
+}
 void patcherTests() {
     TemporaryFolder folder;
     auto target = folder.path / L"ordinary application.exe", ref = folder.path / L"same build reference.exe";
@@ -380,6 +415,79 @@ void patcherTests() {
     test::require(Patcher(target, {}).createData(ref), "valid TLS layout accepted");
     test::require(mappedPayload(readFile(target)) == mappedPayload(tlsSource),
                   "TLS directory, callbacks and index bytes preserved");
+    // Regression: compaction can trim the all-zero terminator at an exact
+    // FileAlignment boundary. It remains present in the mapped virtual tail.
+    auto compactTLS = tlsSource;
+    IMAGE_TLS_DIRECTORY boundaryTLS = tls;
+    boundaryTLS.AddressOfCallBacks = tlsPE.nt.OptionalHeader.ImageBase + 0x2200 - sizeof(Address);
+    boundaryTLS.StartAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x4000;
+    boundaryTLS.EndAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x4010;
+    store(compactTLS, 0x1480, boundaryTLS);
+    store<Address>(compactTLS, 0x1600 - sizeof(Address), Address(tlsPE.nt.OptionalHeader.ImageBase + 0x1000));
+    writeFileAtomic(target, compactTLS);
+    Patcher(target, {}).createData(ref);
+    Patcher(target, {}).shrink();
+    auto trimmedTLS = readFile(target);
+    PEImage trimmedPE(trimmedTLS);
+    test::rejects([&] { trimmedPE.fileOffset(0x2200, sizeof(Address)); },
+                  "TLS regression actually puts terminator in a virtual tail");
+    test::require(trimmedPE.mappedValue<Address>(trimmedTLS, 0x2200) == 0,
+                  "trimmed TLS callback terminator remains mapped zero");
+    test::require(Patcher(target, {}).createData(ref),
+                  "reference layout can be reapplied after TLS terminator compaction");
+    test::require(mappedPayload(readFile(target)) == mappedPayload(trimmedTLS),
+                  "reapplying layout after compaction preserves TLS image");
+    Patcher(target, {}).shrink();
+    test::require(readFile(target) == trimmedTLS,
+                  "layout/compact cycle is idempotent with virtual TLS terminator");
+    // An entirely zero callback array in BSS is likewise a valid empty list.
+    boundaryTLS.AddressOfCallBacks = tlsPE.nt.OptionalHeader.ImageBase + 0x4300;
+    store(compactTLS, 0x1480, boundaryTLS);
+    writeFileAtomic(target, compactTLS);
+    Patcher(target, {}).createData(ref);
+    Patcher(target, {}).shrink();
+    auto bssTLS = readFile(target);
+    PEImage bssPE(bssTLS);
+    test::rejects([&] { bssPE.fileOffset(0x4300, sizeof(Address)); },
+                  "BSS callback regression reads genuinely virtual-only storage");
+    test::require(Patcher(target, {}).createData(ref),
+                  "zero-filled BSS callback list accepted after compaction");
+    auto badTemplate = tlsSource;
+    auto templateTLS = tls;
+    templateTLS.StartAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x3100;
+    templateTLS.EndAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x3000;
+    store(badTemplate, 0x1480, templateTLS);
+    rejectsLayout(badTemplate, reference, "reversed TLS template range rejected before writing");
+    templateTLS.StartAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x5ff0;
+    templateTLS.EndAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x6001;
+    store(badTemplate, 0x1480, templateTLS);
+    rejectsLayout(badTemplate, reference, "TLS template outside image rejected before writing");
+    // Both endpoints are individually valid, but the range crosses a hole.
+    auto gapTLS = source;
+    PEImage gapTLSPE(gapTLS);
+    gapTLSPE.sections.back().header.VirtualAddress = 0x6000;
+    gapTLSPE.nt.OptionalHeader.SizeOfImage = 0x7000;
+    gapTLSPE.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS] = {0x2080,
+                                                                           sizeof(IMAGE_TLS_DIRECTORY)};
+    gapTLSPE.save(gapTLS);
+    templateTLS.StartAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x4ff0;
+    templateTLS.EndAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x6010;
+    store(gapTLS, 0x1480, templateTLS);
+    auto gapRef = reference;
+    PEImage gapRefPE(gapRef);
+    gapRefPE.sections.back().header.VirtualAddress = 0x6000;
+    gapRefPE.nt.OptionalHeader.SizeOfImage = 0x7000;
+    gapRefPE.save(gapRef);
+    rejectsLayout(gapTLS, gapRef, "TLS template may not cross unmapped sections");
+    writeFileAtomic(ref, reference);
+    // EndAddressOfRawData is exclusive; exactly SizeOfImage is valid.
+    auto endTLS = tlsSource;
+    auto exactEnd = tls;
+    exactEnd.StartAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x5ff0;
+    exactEnd.EndAddressOfRawData = tlsPE.nt.OptionalHeader.ImageBase + 0x6000;
+    store(endTLS, 0x1480, exactEnd);
+    writeFileAtomic(target, endTLS);
+    test::require(Patcher(target, {}).createData(ref), "TLS template permits exclusive image-end boundary");
     auto debugSource = source;
     PEImage debugPE(debugSource);
     debugPE.nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG] = {0x2100,
@@ -422,6 +530,55 @@ void patcherTests() {
     writeFileAtomic(target, gap);
     test::rejects([&] { Patcher(target, {}).shrink(); }, "compaction refuses nonzero unclassified raw gaps");
     test::require(readFile(target) == gap, "failed compaction leaves original file intact");
+}
+void compactionLayoutTests() {
+    TemporaryFolder folder;
+    auto seed = fixture();
+    PEImage pe(seed);
+    pe.nt.OptionalHeader.SizeOfHeaders = 0x1000;
+    pe.nt.OptionalHeader.SizeOfImage = 0x50000;
+    pe.sections.clear();
+    for (DWORD i = 0; i < 40; ++i) {
+        Section part;
+        part.rename(i == 0 ? ".text" : ".custom");
+        part.header.VirtualAddress = 0x1000 + i * 0x2000;
+        part.header.Misc.VirtualSize = 0x1000;
+        part.header.SizeOfRawData = i && i % 5 == 0 ? 0 : 0x200 * (1 + i % 4);
+        part.header.Characteristics =
+            IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE | IMAGE_SCN_CNT_INITIALIZED_DATA;
+        if (!i)
+            part.header.Characteristics |= IMAGE_SCN_MEM_EXECUTE;
+        pe.sections.push_back(part);
+    }
+    Bytes bytes(0x1000);
+    std::copy_n(seed.begin(), 0x200, bytes.begin());
+    // Deliberately reverse raw-file order, include zero raw-size sections and
+    // physical/virtual gaps, and retain a nonzero overlay.
+    for (std::size_t i = pe.sections.size(); i-- > 0;) {
+        auto &h = pe.sections[i].header;
+        if (!h.SizeOfRawData)
+            continue;
+        bytes.resize(bytes.size() + 0x200 * (i % 3));
+        h.PointerToRawData = rva32(bytes.size());
+        bytes.resize(bytes.size() + h.SizeOfRawData);
+        bytes[h.PointerToRawData + (i * 73) % h.SizeOfRawData] = BYTE(i + 1);
+    }
+    const Bytes overlay{0x15, 0x37, 0, 0, 0x99};
+    bytes.insert(bytes.end(), overlay.begin(), overlay.end());
+    pe.save(bytes);
+    auto path = folder.path / L"many sections.exe";
+    writeFileAtomic(path, bytes);
+    Patcher(path, {}).shrink();
+    auto packed = readFile(path);
+    PEImage compact(packed);
+    test::require(compact.sections.size() == 40, "compaction retains all sections in varied physical order");
+    test::require(mappedPayload(packed) == mappedPayload(bytes),
+                  "planned compaction preserves all section data and virtual zeros");
+    test::require(packed.size() < bytes.size(), "planned compaction removes padding in many-section file");
+    test::require(std::equal(overlay.begin(), overlay.end(), packed.end() - overlay.size()),
+                  "planned output preserves complete overlay");
+    Patcher(path, {}).shrink();
+    test::require(readFile(path) == packed, "planned many-section compaction is idempotent");
 }
 void processCopyTests() {
     TemporaryFolder folder;
@@ -816,7 +973,9 @@ int main() {
         trimTests();
         disassemblyTests();
         fileTests();
+        mappedReadTests();
         patcherTests();
+        compactionLayoutTests();
         processCopyTests();
         temporaryDllTests();
         memoryTests();

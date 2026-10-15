@@ -55,14 +55,20 @@ void validateEntryAndTLS(const PEImage &pe, std::span<const BYTE> bytes) {
         return;
     if (dir.Size < sizeof(IMAGE_TLS_DIRECTORY))
         throw std::runtime_error("Truncated TLS directory");
-    auto tls =
-        load<IMAGE_TLS_DIRECTORY>(bytes, pe.fileOffset(dir.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY)));
-    auto toRVA = [&](std::uint64_t va) {
+    auto tls = pe.mappedValue<IMAGE_TLS_DIRECTORY>(bytes, dir.VirtualAddress);
+    auto toRVA = [&](std::uint64_t va, bool endpoint = false) {
         if (va < pe.nt.OptionalHeader.ImageBase ||
-            va - pe.nt.OptionalHeader.ImageBase >= pe.nt.OptionalHeader.SizeOfImage)
+            va - pe.nt.OptionalHeader.ImageBase > pe.nt.OptionalHeader.SizeOfImage ||
+            (!endpoint && va - pe.nt.OptionalHeader.ImageBase == pe.nt.OptionalHeader.SizeOfImage))
             throw std::runtime_error("TLS VA outside image");
         return rva32(va - pe.nt.OptionalHeader.ImageBase);
     };
+    if (tls.StartAddressOfRawData || tls.EndAddressOfRawData) {
+        if (!tls.StartAddressOfRawData || tls.EndAddressOfRawData < tls.StartAddressOfRawData)
+            throw std::runtime_error("Invalid TLS template range");
+        auto start = toRVA(tls.StartAddressOfRawData, true), end = toRVA(tls.EndAddressOfRawData, true);
+        pe.validateMappedRange(bytes, start, end - start);
+    }
     if (tls.AddressOfIndex) {
         auto rva = toRVA(tls.AddressOfIndex);
         auto idx = pe.sectionAt(rva);
@@ -74,8 +80,7 @@ void validateEntryAndTLS(const PEImage &pe, std::span<const BYTE> bytes) {
     if (tls.AddressOfCallBacks) {
         auto rva = toRVA(tls.AddressOfCallBacks);
         for (unsigned i = 0; i < 1024; ++i) {
-            auto callback = load<Address>(
-                bytes, pe.fileOffset(rva32(std::uint64_t(rva) + i * sizeof(Address)), sizeof(Address)));
+            auto callback = pe.mappedValue<Address>(bytes, rva32(std::uint64_t(rva) + i * sizeof(Address)));
             if (!callback)
                 return;
             if (!executable(toRVA(callback)))
@@ -279,11 +284,14 @@ void Patcher::shrink() {
         if (debug.Size % sizeof(IMAGE_DEBUG_DIRECTORY))
             throw std::runtime_error("Invalid debug directory size");
         auto off = pe_.fileOffset(debug.VirtualAddress, debug.Size);
+        debugEntries.reserve(debug.Size / sizeof(IMAGE_DEBUG_DIRECTORY));
         for (std::size_t i = 0; i < debug.Size / sizeof(IMAGE_DEBUG_DIRECTORY); ++i)
             debugEntries.push_back(
                 load<IMAGE_DEBUG_DIRECTORY>(data_, off + i * sizeof(IMAGE_DEBUG_DIRECTORY)));
     }
-    Bytes packed(data_.begin(), data_.begin() + pe_.nt.OptionalHeader.SizeOfHeaders);
+    // Plan the complete output before allocating/copying it. This avoids
+    // repeated vector growth and copying large sections during compaction.
+    std::size_t packedSize = pe_.nt.OptionalHeader.SizeOfHeaders;
     for (std::size_t i = 0; i < pe_.sections.size(); ++i) {
         auto &h = pe_.sections[i].header;
         auto old = h;
@@ -303,15 +311,23 @@ void Patcher::shrink() {
             n = std::max(n, debug.VirtualAddress - old.VirtualAddress + debug.Size);
         h.Misc.VirtualSize = extent(old); // trimmed raw zeros remain mapped zeros
         h.SizeOfRawData = pe_.fileAlign(n);
-        h.PointerToRawData = h.SizeOfRawData ? pe_.fileAlign(rva32(packed.size())) : 0;
-        if (h.SizeOfRawData) {
-            packed.resize(h.PointerToRawData);
-            packed.insert(packed.end(), data_.begin() + old.PointerToRawData,
-                          data_.begin() + old.PointerToRawData + h.SizeOfRawData);
-        }
+        h.PointerToRawData = h.SizeOfRawData ? pe_.fileAlign(rva32(packedSize)) : 0;
+        if (h.SizeOfRawData)
+            packedSize = rva32(std::uint64_t(h.PointerToRawData) + h.SizeOfRawData);
     }
-    auto newOverlay = packed.size();
-    packed.insert(packed.end(), data_.begin() + oldOverlay, data_.end());
+    auto newOverlay = packedSize;
+    auto overlaySize = data_.size() - oldOverlay;
+    if (overlaySize > SIZE_MAX - packedSize)
+        throw std::runtime_error("Compacted file size overflow");
+    Bytes packed(packedSize + overlaySize);
+    std::copy_n(data_.begin(), pe_.nt.OptionalHeader.SizeOfHeaders, packed.begin());
+    for (std::size_t i = 0; i < pe_.sections.size(); ++i) {
+        const auto &h = pe_.sections[i].header;
+        if (h.SizeOfRawData)
+            std::copy_n(data_.begin() + original.sections[i].header.PointerToRawData, h.SizeOfRawData,
+                        packed.begin() + h.PointerToRawData);
+    }
+    std::copy(data_.begin() + oldOverlay, data_.end(), packed.begin() + newOverlay);
     auto remap = [&](DWORD offset, DWORD size) -> DWORD {
         bounds(data_.size(), offset, size);
         if (offset >= oldOverlay)
